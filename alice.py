@@ -43,12 +43,20 @@ def _alice_response(text: str, *, end_session: bool = False, buttons: list[str] 
     return response
 
 
+# Replaces visually identical Latin letters with Cyrillic equivalents.
+# Fixes mismatches like "Aнна" (Latin A) vs spoken "Анна" (Cyrillic А).
+_LAT_TO_CYR = str.maketrans("AaEeOoCcKkMmHhPpTtXxBb", "АаЕеОоСсКкМмНнРрТтХхВв")
+
+
+def _norm(s: str) -> str:
+    return s.lower().translate(_LAT_TO_CYR)
+
+
 def _find_contact(query: str, contacts: dict[int, str]) -> tuple[int, str] | None:
-    query = query.lower().strip()
+    q = _norm(query.strip())
     for chat_id, name in contacts.items():
-        name_lower = name.lower()
-        parts = name_lower.split()
-        if query == name_lower or query in parts or any(p.startswith(query) for p in parts):
+        parts = [_norm(p) for p in name.split()]
+        if q == _norm(name) or q in parts or any(p.startswith(q) for p in parts):
             return chat_id, name
     return None
 
