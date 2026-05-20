@@ -9,14 +9,25 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 
-async def send_sos(bot: Bot, extra_message: str = "") -> tuple[int, int]:
+async def send_sos(
+    bot: Bot,
+    extra_message: str = "",
+    contact_ids: list[int] | None = None,
+) -> tuple[int, int]:
     """
-    Sends SOS to all contacts.
+    Sends SOS to contacts.
+    If contact_ids is None, sends to all contacts.
     Returns (sent_count, failed_count).
     """
-    contacts = await storage.get_contacts()
+    all_contacts = await storage.get_contacts()
+
+    if contact_ids is not None:
+        contacts = {cid: all_contacts[cid] for cid in contact_ids if cid in all_contacts}
+    else:
+        contacts = all_contacts
+
     if not contacts:
-        logger.warning("SOS triggered but no contacts registered")
+        logger.warning("SOS triggered but no contacts to send to")
         return 0, 0
 
     timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")

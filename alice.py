@@ -4,8 +4,6 @@ Yandex Alice (Яндекс Алиса) skill webhook handler.
 Skill setup in Yandex Dialogs (https://dialogs.yandex.ru/developer):
   - Activation phrase: "СОС" / "тревога" / "помощь"
   - Webhook URL: https://your-domain.com/alice
-  - Set the ALICE_SECRET env var and add it to the skill's header config
-    (Header: X-Alice-Secret: <value>) for request verification.
 """
 
 import logging
@@ -14,14 +12,17 @@ from aiogram import Bot
 from fastapi import APIRouter, Header, HTTPException, Request
 
 import notifier
+import storage
 from config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-_CONFIRM_WORDS = {"да", "конечно", "yes", "ок", "ok", "давай", "подтверждаю"}
+_CONFIRM_WORDS = {"да", "конечно", "yes", "ок", "ok", "давай", "подтверждаю", "отправляй"}
 _CANCEL_WORDS = {"нет", "отмена", "cancel", "стоп", "не надо", "отменить"}
 _DONE_WORDS = {"всё", "все", "готово", "достаточно", "хватит", "ладно", "закончить"}
+_ALL_WORDS = {"всем", "всё", "все", "всем контактам"}
+_SPECIFIC_WORDS = {"конкретному", "одному", "выбрать", "определённому"}
 
 _sessions: dict[str, dict] = {}
 
@@ -42,6 +43,20 @@ def _alice_response(text: str, *, end_session: bool = False, buttons: list[str] 
     return response
 
 
+def _find_contact(query: str, contacts: dict[int, str]) -> tuple[int, str] | None:
+    query = query.lower().strip()
+    for chat_id, name in contacts.items():
+        name_lower = name.lower()
+        parts = name_lower.split()
+        if query == name_lower or query in parts or any(p.startswith(query) for p in parts):
+            return chat_id, name
+    return None
+
+
+def _contact_first_names(contacts: dict[int, str]) -> str:
+    return ", ".join(name.split()[0] for name in contacts.values())
+
+
 @router.post("/alice")
 async def alice_webhook(
     request: Request,
@@ -60,55 +75,124 @@ async def alice_webhook(
     command: str = req.get("command", "").strip().lower()
 
     if is_new_session:
-        _sessions[session_id] = {"state": "awaiting_confirmation"}
+        contacts = await storage.get_contacts()
+        if not contacts:
+            return _alice_response(
+                "Список контактов пуст. Добавьте контакты через Telegram бота.",
+                end_session=True,
+            )
+        count = len(contacts)
+        _sessions[session_id] = {"state": "awaiting_recipient"}
+        buttons = ["Всем", "Конкретному"] if count > 1 else ["Да"]
         return _alice_response(
-            "Навык экстренного оповещения активирован. "
-            "Отправить SOS всем контактам?",
-            buttons=["Да", "Нет"],
+            f"Навык экстренного оповещения. "
+            f"Отправить SOS всем {count} контактам или конкретному человеку?",
+            buttons=buttons,
         )
 
-    state_data = _sessions.get(session_id, {"state": "awaiting_confirmation"})
+    state_data = _sessions.get(session_id, {"state": "awaiting_recipient"})
     state = state_data["state"]
 
-    if state == "awaiting_confirmation":
+    if state == "awaiting_recipient":
         if any(w in command for w in _CANCEL_WORDS):
             _sessions.pop(session_id, None)
             return _alice_response("Отменено. Будьте в безопасности.", end_session=True)
 
-        if any(w in command for w in _CONFIRM_WORDS) or command in ("sos", "с о с"):
-            _sessions[session_id] = {"state": "awaiting_message"}
+        if any(w in command for w in _ALL_WORDS) or any(w in command for w in _CONFIRM_WORDS):
+            _sessions[session_id] = {"state": "awaiting_message", "recipient_ids": None}
             return _alice_response(
-                "SOS отправляю. Хотите добавить сообщение? "
-                "Скажите что передать или 'всё' чтобы завершить.",
+                "Отправляю всем. Хотите добавить сообщение? Скажите что передать или 'всё'.",
+                buttons=["Всё"],
+            )
+
+        if any(w in command for w in _SPECIFIC_WORDS):
+            contacts = await storage.get_contacts()
+            _sessions[session_id] = {"state": "awaiting_name"}
+            return _alice_response(
+                f"Кому отправить? Назовите имя. Доступные контакты: {_contact_first_names(contacts)}.",
+            )
+
+        contacts = await storage.get_contacts()
+        match = _find_contact(command, contacts)
+        if match:
+            chat_id, name = match
+            _sessions[session_id] = {
+                "state": "awaiting_specific_confirmation",
+                "recipient_id": chat_id,
+                "recipient_name": name,
+            }
+            return _alice_response(f"Отправить SOS контакту {name}?", buttons=["Да", "Нет"])
+
+        return _alice_response(
+            "Скажите 'всем' чтобы оповестить всех, или 'конкретному' чтобы выбрать человека.",
+            buttons=["Всем", "Конкретному"],
+        )
+
+    if state == "awaiting_name":
+        if any(w in command for w in _CANCEL_WORDS):
+            _sessions.pop(session_id, None)
+            return _alice_response("Отменено.", end_session=True)
+
+        contacts = await storage.get_contacts()
+        match = _find_contact(command, contacts)
+        if match:
+            chat_id, name = match
+            _sessions[session_id] = {
+                "state": "awaiting_specific_confirmation",
+                "recipient_id": chat_id,
+                "recipient_name": name,
+            }
+            return _alice_response(f"Отправить SOS контакту {name}?", buttons=["Да", "Нет"])
+
+        return _alice_response(
+            f"Не нашла такого контакта. Попробуйте ещё раз. "
+            f"Доступные: {_contact_first_names(contacts)}.",
+        )
+
+    if state == "awaiting_specific_confirmation":
+        name = state_data["recipient_name"]
+
+        if any(w in command for w in _CANCEL_WORDS):
+            _sessions.pop(session_id, None)
+            return _alice_response("Отменено.", end_session=True)
+
+        if any(w in command for w in _CONFIRM_WORDS):
+            _sessions[session_id] = {
+                "state": "awaiting_message",
+                "recipient_ids": [state_data["recipient_id"]],
+                "recipient_name": name,
+            }
+            return _alice_response(
+                f"Хорошо. Хотите добавить сообщение для {name}? Скажите что передать или 'всё'.",
                 buttons=["Всё"],
             )
 
         return _alice_response(
-            "Не расслышала. Скажите 'да' чтобы отправить сигнал тревоги, "
-            "или 'нет' для отмены.",
+            f"Отправить SOS контакту {name}? Скажите да или нет.",
             buttons=["Да", "Нет"],
         )
 
     if state == "awaiting_message":
         extra = ""
-        end = False
-
-        if any(w in command for w in _DONE_WORDS):
-            end = True
-        else:
+        if not any(w in command for w in _DONE_WORDS):
             extra = req.get("original_utterance", command)
 
-        sent, failed = await notifier.send_sos(bot, extra_message=extra)
+        recipient_ids: list[int] | None = state_data.get("recipient_ids")
+        sent, failed = await notifier.send_sos(bot, extra_message=extra, contact_ids=recipient_ids)
         _sessions.pop(session_id, None)
 
         if sent == 0:
-            reply = "Список контактов пуст. Добавьте контакты через Telegram бота."
+            reply = "Не удалось отправить. Проверьте список контактов."
         else:
-            reply = f"SOS отправлен {sent} контактам. Помощь в пути. Держитесь!"
+            recipient_name = state_data.get("recipient_name")
+            if recipient_name:
+                reply = f"SOS отправлен контакту {recipient_name}. Держитесь!"
+            else:
+                reply = f"SOS отправлен {sent} контактам. Помощь в пути. Держитесь!"
             if failed:
                 reply += f" Не удалось доставить {failed}."
 
-        logger.info("Alice SOS: sent=%d failed=%d extra=%r", sent, failed, extra)
+        logger.info("Alice SOS: sent=%d failed=%d extra=%r recipients=%r", sent, failed, extra, recipient_ids)
         return _alice_response(reply, end_session=True)
 
     _sessions.pop(session_id, None)
