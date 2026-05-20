@@ -87,6 +87,10 @@ async def alice_webhook(
     session_id: str = session.get("session_id", "")
     is_new_session: bool = session.get("new", False)
     command: str = req.get("command", "").strip().lower()
+    utterance: str = req.get("original_utterance", "").strip().lower()
+
+    def _has(words: set) -> bool:
+        return any(w in command or w in utterance for w in words)
 
     if is_new_session:
         contacts = await storage.get_contacts()
@@ -108,18 +112,18 @@ async def alice_webhook(
     state = state_data["state"]
 
     if state == "awaiting_recipient":
-        if any(w in command for w in _CANCEL_WORDS):
+        if _has(_CANCEL_WORDS):
             _sessions.pop(session_id, None)
             return _alice_response("Отменено. Будьте в безопасности.", end_session=True)
 
-        if any(w in command for w in _ALL_WORDS) or any(w in command for w in _CONFIRM_WORDS):
+        if _has(_ALL_WORDS) or _has(_CONFIRM_WORDS):
             _sessions[session_id] = {"state": "awaiting_message", "recipient_ids": None}
             return _alice_response(
                 "Отправляю всем. Хотите добавить сообщение? Скажите что передать или 'всё'.",
                 buttons=["Всё"],
             )
 
-        if any(w in command for w in _SPECIFIC_WORDS):
+        if _has(_SPECIFIC_WORDS):
             contacts = await storage.get_contacts()
             _sessions[session_id] = {"state": "awaiting_name"}
             return _alice_response(
@@ -127,7 +131,7 @@ async def alice_webhook(
             )
 
         contacts = await storage.get_contacts()
-        match = _find_contact(command, contacts)
+        match = _find_contact(utterance or command, contacts)
         if match:
             chat_id, name = match
             _sessions[session_id] = {
@@ -138,17 +142,17 @@ async def alice_webhook(
             return _alice_response(f"Отправить SOS контакту {name}?", buttons=["Да", "Нет"])
 
         return _alice_response(
-            "Скажите 'всем' чтобы оповестить всех, или 'конкретному' чтобы выбрать человека.",
-            buttons=["Всем", "Конкретному"],
+            "Скажите 'всем' чтобы оповестить всех, или 'одному' чтобы выбрать человека.",
+            buttons=["Всем", "Одному"],
         )
 
     if state == "awaiting_name":
-        if any(w in command for w in _CANCEL_WORDS):
+        if _has(_CANCEL_WORDS):
             _sessions.pop(session_id, None)
             return _alice_response("Отменено.", end_session=True)
 
         contacts = await storage.get_contacts()
-        match = _find_contact(command, contacts)
+        match = _find_contact(utterance or command, contacts)
         if match:
             chat_id, name = match
             _sessions[session_id] = {
@@ -166,11 +170,11 @@ async def alice_webhook(
     if state == "awaiting_specific_confirmation":
         name = state_data["recipient_name"]
 
-        if any(w in command for w in _CANCEL_WORDS):
+        if _has(_CANCEL_WORDS):
             _sessions.pop(session_id, None)
             return _alice_response("Отменено.", end_session=True)
 
-        if any(w in command for w in _CONFIRM_WORDS):
+        if _has(_CONFIRM_WORDS):
             _sessions[session_id] = {
                 "state": "awaiting_message",
                 "recipient_ids": [state_data["recipient_id"]],
@@ -188,8 +192,8 @@ async def alice_webhook(
 
     if state == "awaiting_message":
         extra = ""
-        if not any(w in command for w in _DONE_WORDS):
-            extra = req.get("original_utterance", command)
+        if not _has(_DONE_WORDS):
+            extra = utterance or command
 
         recipient_ids: list[int] | None = state_data.get("recipient_ids")
         sent, failed = await notifier.send_sos(bot, extra_message=extra, contact_ids=recipient_ids)
