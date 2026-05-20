@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     port: int = 8000
     alice_secret: str = ""
     contacts_file: str = "contacts.json"
+    tz_offset: int = 0
 
     model_config = {"env_file": ".env"}
 
