@@ -43,13 +43,19 @@ def _alice_response(text: str, *, end_session: bool = False, buttons: list[str] 
     return response
 
 
-# Replaces visually identical Latin letters with Cyrillic equivalents.
-# Fixes mismatches like "Aнна" (Latin A) vs spoken "Анна" (Cyrillic А).
-_LAT_TO_CYR = str.maketrans("AaEeOoCcKkMmHhPpTtXxBb", "АаЕеОоСсКкМмНнРрТтХхВв")
+# Full Latin→Cyrillic transliteration so that stored Latin names (e.g. "Konstantin")
+# match Cyrillic speech transcribed by Alice (e.g. "константин").
+_LAT_TO_CYR: dict[str, str] = {
+    'a': 'а', 'b': 'б', 'c': 'с', 'd': 'д', 'e': 'е', 'f': 'ф',
+    'g': 'г', 'h': 'х', 'i': 'и', 'j': 'й', 'k': 'к', 'l': 'л',
+    'm': 'м', 'n': 'н', 'o': 'о', 'p': 'п', 'q': 'к', 'r': 'р',
+    's': 'с', 't': 'т', 'u': 'у', 'v': 'в', 'w': 'в', 'x': 'х',
+    'y': 'й', 'z': 'з',
+}
 
 
 def _norm(s: str) -> str:
-    return s.lower().translate(_LAT_TO_CYR)
+    return ''.join(_LAT_TO_CYR.get(ch, ch) for ch in s.lower())
 
 
 def _find_contact(query: str, contacts: dict[int, str]) -> tuple[int, str] | None:
