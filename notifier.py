@@ -1,5 +1,7 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+_TZ = timezone(timedelta(hours=5))
 
 from aiogram import Bot
 
@@ -30,7 +32,7 @@ async def send_sos(
         logger.warning("SOS triggered but no contacts to send to")
         return 0, 0
 
-    timestamp = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    timestamp = datetime.now(_TZ).strftime("%d.%m.%Y %H:%M:%S")
     text = (
         f"{settings.sos_message}\n\n"
         f"👤 От: {settings.owner_name}\n"
