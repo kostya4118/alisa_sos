@@ -8,6 +8,7 @@ from fastapi import FastAPI
 
 import alice
 import bot as bot_module
+import db
 from config import settings
 
 logging.basicConfig(
@@ -47,6 +48,7 @@ async def run_server(app: FastAPI) -> None:
 
 
 async def main() -> None:
+    await db.init(settings.db_path)
     telegram_bot = Bot(token=settings.telegram_bot_token)
     dp = bot_module.create_dispatcher()
     app = create_app(telegram_bot)
@@ -70,6 +72,7 @@ async def main() -> None:
         pass
     finally:
         await telegram_bot.session.close()
+        await db.close()
         logger.info("Stopped.")
 
 

@@ -4,6 +4,9 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
     volumes:
-      - ./contacts.json:/app/contacts.json
+      - ./data:/app/data
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1

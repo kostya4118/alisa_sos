@@ -1,19 +1,20 @@
 """
-Yandex Alice (Яндекс Алиса) skill webhook handler.
+Yandex Alice (Яндекс Алиса) skill webhook handler — multi-tenant version.
 
-Skill setup in Yandex Dialogs (https://dialogs.yandex.ru/developer):
-  - Activation phrase: "СОС" / "тревога" / "помощь"
-  - Webhook URL: https://your-domain.com/alice
+Each owner gets a personal webhook URL:
+    POST /alice/{webhook_token}
+
+The webhook_token is generated at /register and must be pasted into the
+owner's Yandex Dialogs skill settings as the Webhook URL.
 """
 
 import logging
 
 from aiogram import Bot
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 
+import db
 import notifier
-import storage
-from config import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -26,25 +27,6 @@ _SPECIFIC_WORDS = {"конкретному", "одному", "выбрать", "
 
 _sessions: dict[str, dict] = {}
 
-
-def _alice_response(text: str, *, end_session: bool = False, buttons: list[str] | None = None) -> dict:
-    response: dict = {
-        "version": "1.0",
-        "response": {
-            "text": text,
-            "tts": text,
-            "end_session": end_session,
-        },
-    }
-    if buttons:
-        response["response"]["buttons"] = [
-            {"title": b, "hide": True} for b in buttons
-        ]
-    return response
-
-
-# Full Latin→Cyrillic transliteration so that stored Latin names (e.g. "Konstantin")
-# match Cyrillic speech transcribed by Alice (e.g. "константин").
 _LAT_TO_CYR: dict[str, str] = {
     'a': 'а', 'b': 'б', 'c': 'с', 'd': 'д', 'e': 'е', 'f': 'ф',
     'g': 'г', 'h': 'х', 'i': 'и', 'j': 'й', 'k': 'к', 'l': 'л',
@@ -71,16 +53,28 @@ def _contact_first_names(contacts: dict[int, str]) -> str:
     return ", ".join(name.split()[0] for name in contacts.values())
 
 
-@router.post("/alice")
-async def alice_webhook(
-    request: Request,
-    x_alice_secret: str | None = Header(default=None, alias="X-Alice-Secret"),
-):
-    if settings.alice_secret and x_alice_secret != settings.alice_secret:
-        raise HTTPException(status_code=403, detail="Invalid secret")
+def _alice_response(text: str, *, end_session: bool = False, buttons: list[str] | None = None) -> dict:
+    response: dict = {
+        "version": "1.0",
+        "response": {
+            "text": text,
+            "tts": text,
+            "end_session": end_session,
+        },
+    }
+    if buttons:
+        response["response"]["buttons"] = [{"title": b, "hide": True} for b in buttons]
+    return response
 
-    body: dict = await request.json()
+
+@router.post("/alice/{webhook_token}")
+async def alice_webhook(webhook_token: str, request: Request):
+    owner = await db.get_owner_by_token(webhook_token)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Unknown webhook token")
+
     bot: Bot = request.app.state.bot
+    body: dict = await request.json()
 
     session = body.get("session", {})
     req = body.get("request", {})
@@ -93,22 +87,22 @@ async def alice_webhook(
         return any(w in command or w in utterance for w in words)
 
     if is_new_session:
-        contacts = await storage.get_contacts()
+        contacts = await db.get_contacts(owner.chat_id)
         if not contacts:
             return _alice_response(
                 "Список контактов пуст. Добавьте контакты через Telegram бота.",
                 end_session=True,
             )
         count = len(contacts)
-        _sessions[session_id] = {"state": "awaiting_recipient"}
-        buttons = ["Всем", "Конкретному"] if count > 1 else ["Да"]
+        _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
+        buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
         return _alice_response(
             f"Навык экстренного оповещения. "
-            f"Отправить SOS всем {count} контактам или конкретному человеку?",
+            f"Отправить SOS всем {count} контактам или одному?",
             buttons=buttons,
         )
 
-    state_data = _sessions.get(session_id, {"state": "awaiting_recipient"})
+    state_data = _sessions.get(session_id, {"state": "awaiting_recipient", "owner_id": owner.chat_id})
     state = state_data["state"]
 
     if state == "awaiting_recipient":
@@ -117,25 +111,26 @@ async def alice_webhook(
             return _alice_response("Отменено. Будьте в безопасности.", end_session=True)
 
         if _has(_ALL_WORDS) or _has(_CONFIRM_WORDS):
-            _sessions[session_id] = {"state": "awaiting_message", "recipient_ids": None}
+            _sessions[session_id] = {"state": "awaiting_message", "owner_id": owner.chat_id, "recipient_ids": None}
             return _alice_response(
                 "Отправляю всем. Хотите добавить сообщение? Скажите что передать или 'всё'.",
                 buttons=["Всё"],
             )
 
         if _has(_SPECIFIC_WORDS):
-            contacts = await storage.get_contacts()
-            _sessions[session_id] = {"state": "awaiting_name"}
+            contacts = await db.get_contacts(owner.chat_id)
+            _sessions[session_id] = {"state": "awaiting_name", "owner_id": owner.chat_id}
             return _alice_response(
                 f"Кому отправить? Назовите имя. Доступные контакты: {_contact_first_names(contacts)}.",
             )
 
-        contacts = await storage.get_contacts()
+        contacts = await db.get_contacts(owner.chat_id)
         match = _find_contact(utterance or command, contacts)
         if match:
             chat_id, name = match
             _sessions[session_id] = {
                 "state": "awaiting_specific_confirmation",
+                "owner_id": owner.chat_id,
                 "recipient_id": chat_id,
                 "recipient_name": name,
             }
@@ -151,12 +146,13 @@ async def alice_webhook(
             _sessions.pop(session_id, None)
             return _alice_response("Отменено.", end_session=True)
 
-        contacts = await storage.get_contacts()
+        contacts = await db.get_contacts(owner.chat_id)
         match = _find_contact(utterance or command, contacts)
         if match:
             chat_id, name = match
             _sessions[session_id] = {
                 "state": "awaiting_specific_confirmation",
+                "owner_id": owner.chat_id,
                 "recipient_id": chat_id,
                 "recipient_name": name,
             }
@@ -177,6 +173,7 @@ async def alice_webhook(
         if _has(_CONFIRM_WORDS):
             _sessions[session_id] = {
                 "state": "awaiting_message",
+                "owner_id": owner.chat_id,
                 "recipient_ids": [state_data["recipient_id"]],
                 "recipient_name": name,
             }
@@ -196,21 +193,22 @@ async def alice_webhook(
             extra = utterance or command
 
         recipient_ids: list[int] | None = state_data.get("recipient_ids")
-        sent, failed = await notifier.send_sos(bot, extra_message=extra, contact_ids=recipient_ids)
+        sent, failed = await notifier.send_sos(bot, owner, extra_message=extra, contact_ids=recipient_ids)
         _sessions.pop(session_id, None)
 
         if sent == 0:
             reply = "Не удалось отправить. Проверьте список контактов."
         else:
             recipient_name = state_data.get("recipient_name")
-            if recipient_name:
-                reply = f"SOS отправлен контакту {recipient_name}. Держитесь!"
-            else:
-                reply = f"SOS отправлен {sent} контактам. Помощь в пути. Держитесь!"
+            reply = (
+                f"SOS отправлен контакту {recipient_name}. Держитесь!"
+                if recipient_name
+                else f"SOS отправлен {sent} контактам. Помощь в пути. Держитесь!"
+            )
             if failed:
                 reply += f" Не удалось доставить {failed}."
 
-        logger.info("Alice SOS: sent=%d failed=%d extra=%r recipients=%r", sent, failed, extra, recipient_ids)
+        logger.info("Alice SOS owner=%d sent=%d failed=%d extra=%r", owner.chat_id, sent, failed, extra)
         return _alice_response(reply, end_session=True)
 
     _sessions.pop(session_id, None)
