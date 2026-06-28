@@ -18,6 +18,7 @@ import logging
 import os
 
 import db
+import guide
 import messaging
 import notifier
 from config import settings
@@ -199,6 +200,7 @@ async def _register(chat_id: int, name: str) -> None:
             "Поделитесь ссылкой для друзей из меню.",
             _menu_kb(),
         )
+        await _send(chat_id, guide.alice_setup_instructions())
         return
 
     # Admin gate: create pending, notify admin (on Telegram).
@@ -214,7 +216,15 @@ async def _register(chat_id: int, name: str) -> None:
     else:
         # No reachable admin channel — fall back to active so the user isn't stuck.
         await db.set_owner_status(chat_id, "active")
-        await _send(chat_id, "✅ Вы зарегистрированы!", _menu_kb())
+        owner = await db.get_owner(chat_id)
+        webhook_url = f"{settings.base_url}/alice/{owner.webhook_token}" if owner else ""
+        await _send(
+            chat_id,
+            "✅ Вы зарегистрированы!\n\n"
+            f"Webhook URL для Яндекс Диалогов:\n{webhook_url}",
+            _menu_kb(),
+        )
+        await _send(chat_id, guide.alice_setup_instructions())
 
 
 async def _subscribe(chat_id: int, name: str, token: str) -> None:

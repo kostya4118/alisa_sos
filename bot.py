@@ -16,6 +16,7 @@ from aiogram.types import (
 
 import checkin as checkin_module
 import db
+import guide
 import messaging
 import notifier
 from config import settings
@@ -237,11 +238,11 @@ async def cmd_register(message: Message) -> None:
             f"<code>{webhook_url}</code>\n\n"
             f"<b>Ссылки для друзей:</b>\n"
             f"{links}\n\n"
-            "Скопируйте Webhook URL и вставьте в настройки своего навыка Алисы.\n"
             "Поделитесь ссылкой с друзьями — они подпишутся одним нажатием.",
             parse_mode="HTML",
             reply_markup=_owner_keyboard(),
         )
+        await message.answer(guide.alice_setup_instructions())
     else:
         await db.create_owner(chat_id, name, status="pending", platform=db.TELEGRAM)
         await message.answer(
@@ -288,6 +289,7 @@ async def callback_approve(callback: CallbackQuery) -> None:
                 f"Webhook URL для Яндекс Диалогов:\n{webhook_url}\n\n"
                 "Откройте бота и используйте кнопки для управления.",
             )
+            await messaging.send(db.MAX, chat_id, guide.alice_setup_instructions())
         else:
             links = await _subscribe_links_text(callback.message.bot, owner)
             await callback.message.bot.send_message(
@@ -301,6 +303,7 @@ async def callback_approve(callback: CallbackQuery) -> None:
                 parse_mode="HTML",
                 reply_markup=_owner_keyboard(),
             )
+            await callback.message.bot.send_message(chat_id, guide.alice_setup_instructions())
     except Exception:
         logger.exception("Failed to notify user %d about approval", chat_id)
     await callback.answer("✅ Одобрено")
