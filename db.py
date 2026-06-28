@@ -6,6 +6,10 @@ import aiosqlite
 
 _conn: aiosqlite.Connection | None = None
 
+# Supported messaging platforms
+TELEGRAM = "telegram"
+MAX = "max"
+
 
 @dataclass
 class Owner:
@@ -14,7 +18,18 @@ class Owner:
     sos_message: str
     tz_offset: int
     webhook_token: str
-    status: str = field(default="active")  # "pending" | "active"
+    status: str = field(default="active")      # "pending" | "active"
+    platform: str = field(default=TELEGRAM)    # "telegram" | "max"
+
+
+@dataclass
+class Contact:
+    chat_id: int
+    name: str
+    platform: str = TELEGRAM
+
+    def first_name(self) -> str:
+        return self.name.split()[0] if self.name else self.name
 
 
 async def init(path: str) -> None:
@@ -28,16 +43,20 @@ async def init(path: str) -> None:
             name          TEXT    NOT NULL,
             sos_message   TEXT    NOT NULL DEFAULT '🆘 ТРЕВОГА! Мне нужна помощь!',
             tz_offset     INTEGER NOT NULL DEFAULT 0,
-            webhook_token TEXT    NOT NULL UNIQUE
+            webhook_token TEXT    NOT NULL UNIQUE,
+            status        TEXT    NOT NULL DEFAULT 'active',
+            platform      TEXT    NOT NULL DEFAULT 'telegram'
         );
         CREATE TABLE IF NOT EXISTS contacts (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id  INTEGER NOT NULL REFERENCES owners(chat_id) ON DELETE CASCADE,
             chat_id   INTEGER NOT NULL,
             name      TEXT    NOT NULL,
-            UNIQUE(owner_id, chat_id)
+            platform  TEXT    NOT NULL DEFAULT 'telegram',
+            UNIQUE(owner_id, chat_id, platform)
         );
         CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_id);
+        CREATE INDEX IF NOT EXISTS idx_contacts_chat ON contacts(chat_id, platform);
         CREATE TABLE IF NOT EXISTS checkins (
             owner_id      INTEGER PRIMARY KEY REFERENCES owners(chat_id) ON DELETE CASCADE,
             enabled       INTEGER NOT NULL DEFAULT 0,
@@ -53,16 +72,23 @@ async def init(path: str) -> None:
             contact_name TEXT    NOT NULL,
             text         TEXT    NOT NULL,
             created_at   INTEGER NOT NULL,
-            read         INTEGER NOT NULL DEFAULT 0
+            read         INTEGER NOT NULL DEFAULT 0,
+            platform     TEXT    NOT NULL DEFAULT 'telegram'
         );
     """)
     await _conn.commit()
-    # Add status column to existing installations (idempotent)
-    try:
-        await _conn.execute("ALTER TABLE owners ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
-        await _conn.commit()
-    except aiosqlite.OperationalError:
-        pass  # column already exists
+    # Idempotent column additions for installations created before these columns existed.
+    for table, col, ddl in (
+        ("owners", "status", "ALTER TABLE owners ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
+        ("owners", "platform", "ALTER TABLE owners ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
+        ("contacts", "platform", "ALTER TABLE contacts ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
+        ("replies", "platform", "ALTER TABLE replies ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
+    ):
+        try:
+            await _conn.execute(ddl)
+            await _conn.commit()
+        except aiosqlite.OperationalError:
+            pass  # column already exists
 
 
 async def close() -> None:
@@ -84,8 +110,13 @@ def _row_to_owner(row) -> Owner:
         tz_offset=d["tz_offset"],
         webhook_token=d["webhook_token"],
         status=d.get("status", "active"),
+        platform=d.get("platform", TELEGRAM),
     )
 
+
+# ---------------------------------------------------------------------------
+# Owners
+# ---------------------------------------------------------------------------
 
 async def get_owner(chat_id: int) -> Owner | None:
     async with _conn_or_error().execute(
@@ -112,17 +143,19 @@ async def get_all_owners() -> list[Owner]:
     return [_row_to_owner(row) for row in rows]
 
 
-async def create_owner(chat_id: int, name: str, status: str = "active") -> Owner:
+async def create_owner(chat_id: int, name: str, status: str = "active",
+                       platform: str = TELEGRAM) -> Owner:
     token = str(uuid.uuid4())
     conn = _conn_or_error()
     await conn.execute(
-        "INSERT INTO owners(chat_id, name, webhook_token, status) VALUES (?, ?, ?, ?)",
-        (chat_id, name, token, status),
+        "INSERT INTO owners(chat_id, name, webhook_token, status, platform) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (chat_id, name, token, status, platform),
     )
     await conn.commit()
     return Owner(chat_id=chat_id, name=name,
                  sos_message="🆘 ТРЕВОГА! Мне нужна помощь!",
-                 tz_offset=0, webhook_token=token, status=status)
+                 tz_offset=0, webhook_token=token, status=status, platform=platform)
 
 
 async def set_owner_status(chat_id: int, status: str) -> None:
@@ -151,20 +184,26 @@ async def delete_owner(chat_id: int) -> None:
     await conn.commit()
 
 
-async def get_contacts(owner_id: int) -> dict[int, str]:
+# ---------------------------------------------------------------------------
+# Contacts
+# ---------------------------------------------------------------------------
+
+async def get_contacts(owner_id: int) -> list[Contact]:
     async with _conn_or_error().execute(
-        "SELECT chat_id, name FROM contacts WHERE owner_id = ?", (owner_id,)
+        "SELECT chat_id, name, platform FROM contacts WHERE owner_id = ? ORDER BY id",
+        (owner_id,),
     ) as cur:
         rows = await cur.fetchall()
-    return {row["chat_id"]: row["name"] for row in rows}
+    return [Contact(chat_id=r["chat_id"], name=r["name"], platform=r["platform"]) for r in rows]
 
 
-async def add_contact(owner_id: int, chat_id: int, name: str) -> bool:
+async def add_contact(owner_id: int, chat_id: int, name: str,
+                      platform: str = TELEGRAM) -> bool:
     try:
         conn = _conn_or_error()
         await conn.execute(
-            "INSERT INTO contacts(owner_id, chat_id, name) VALUES (?, ?, ?)",
-            (owner_id, chat_id, name),
+            "INSERT INTO contacts(owner_id, chat_id, name, platform) VALUES (?, ?, ?, ?)",
+            (owner_id, chat_id, name, platform),
         )
         await conn.commit()
         return True
@@ -172,60 +211,68 @@ async def add_contact(owner_id: int, chat_id: int, name: str) -> bool:
         return False
 
 
-async def remove_contact(owner_id: int, chat_id: int) -> bool:
+async def remove_contact(owner_id: int, chat_id: int, platform: str = TELEGRAM) -> bool:
     conn = _conn_or_error()
     cur = await conn.execute(
-        "DELETE FROM contacts WHERE owner_id = ? AND chat_id = ?",
-        (owner_id, chat_id),
+        "DELETE FROM contacts WHERE owner_id = ? AND chat_id = ? AND platform = ?",
+        (owner_id, chat_id, platform),
     )
     await conn.commit()
     return cur.rowcount > 0
 
 
-async def remove_subscriber(chat_id: int) -> int:
-    """Remove this chat_id from ALL owners' contact lists."""
+async def remove_subscriber(chat_id: int, platform: str = TELEGRAM) -> int:
+    """Remove this (chat_id, platform) from ALL owners' contact lists."""
     conn = _conn_or_error()
     cur = await conn.execute(
-        "DELETE FROM contacts WHERE chat_id = ?", (chat_id,)
+        "DELETE FROM contacts WHERE chat_id = ? AND platform = ?", (chat_id, platform)
     )
     await conn.commit()
     return cur.rowcount
 
 
-async def contact_exists(owner_id: int, chat_id: int) -> bool:
+async def get_owners_for_contact(contact_id: int, platform: str = TELEGRAM) -> list[Owner]:
+    """Return all owners who have this (chat_id, platform) in their contacts list."""
     async with _conn_or_error().execute(
-        "SELECT 1 FROM contacts WHERE owner_id = ? AND chat_id = ?",
-        (owner_id, chat_id),
-    ) as cur:
-        return await cur.fetchone() is not None
-
-
-async def get_owners_for_contact(contact_id: int) -> list[Owner]:
-    """Return all owners who have this chat_id in their contacts list."""
-    async with _conn_or_error().execute(
-        "SELECT o.* FROM owners o JOIN contacts c ON c.owner_id = o.chat_id WHERE c.chat_id = ?",
-        (contact_id,),
+        "SELECT o.* FROM owners o JOIN contacts c ON c.owner_id = o.chat_id "
+        "WHERE c.chat_id = ? AND c.platform = ?",
+        (contact_id, platform),
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_owner(row) for row in rows]
 
 
-async def add_reply(owner_id: int, contact_id: int, contact_name: str, text: str) -> None:
+# ---------------------------------------------------------------------------
+# Replies
+# ---------------------------------------------------------------------------
+
+async def add_reply(owner_id: int, contact_id: int, contact_name: str, text: str,
+                    platform: str = TELEGRAM) -> None:
     conn = _conn_or_error()
     await conn.execute(
-        "INSERT INTO replies(owner_id, contact_id, contact_name, text, created_at) VALUES (?, ?, ?, ?, ?)",
-        (owner_id, contact_id, contact_name, text, int(time.time())),
+        "INSERT INTO replies(owner_id, contact_id, contact_name, text, created_at, platform) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (owner_id, contact_id, contact_name, text, int(time.time()), platform),
     )
     await conn.commit()
 
 
 async def get_unread_replies(owner_id: int) -> list[dict]:
     async with _conn_or_error().execute(
-        "SELECT contact_id, contact_name, text FROM replies WHERE owner_id = ? AND read = 0 ORDER BY created_at",
+        "SELECT contact_id, contact_name, text, platform FROM replies "
+        "WHERE owner_id = ? AND read = 0 ORDER BY created_at",
         (owner_id,),
     ) as cur:
         rows = await cur.fetchall()
-    return [{"contact_id": row["contact_id"], "contact_name": row["contact_name"], "text": row["text"]} for row in rows]
+    return [
+        {
+            "contact_id": r["contact_id"],
+            "contact_name": r["contact_name"],
+            "text": r["text"],
+            "platform": r["platform"],
+        }
+        for r in rows
+    ]
 
 
 async def mark_replies_read(owner_id: int) -> None:
@@ -247,10 +294,10 @@ async def get_checkin(owner_id: int) -> dict | None:
 
 
 async def get_pending_checkins() -> list[dict]:
-    """All enabled check-ins joined with owner tz_offset."""
+    """All enabled check-ins joined with owner tz_offset and platform."""
     async with _conn_or_error().execute(
         """SELECT c.owner_id, c.enabled, c.time_minutes, c.state, c.attempts,
-                  c.last_asked_at, o.tz_offset
+                  c.last_asked_at, o.tz_offset, o.platform
            FROM checkins c JOIN owners o ON o.chat_id = c.owner_id
            WHERE c.enabled = 1 AND o.status = 'active'"""
     ) as cur:

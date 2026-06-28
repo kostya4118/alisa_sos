@@ -16,6 +16,7 @@ from aiogram.types import (
 
 import checkin as checkin_module
 import db
+import messaging
 import notifier
 from config import settings
 
@@ -24,6 +25,22 @@ router = Router()
 
 # chat_id → "set_name" | "set_message" | "set_tz" | "set_checkin_time"
 _pending_state: dict[int, str] = {}
+
+
+async def _subscribe_links_text(tg_bot, owner: db.Owner) -> str:
+    """Subscribe links for every available platform."""
+    bot_info = await tg_bot.get_me()
+    tg_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
+    lines = [f"📱 Telegram:\n{tg_link}"]
+    if messaging.max_enabled():
+        try:
+            import max_bot
+            max_link = await max_bot.build_subscribe_link(owner.webhook_token)
+            if max_link:
+                lines.append(f"🅼 MAX:\n{max_link}")
+        except Exception:
+            logger.exception("failed to build MAX subscribe link")
+    return "\n\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +157,7 @@ async def cmd_start(message: Message) -> None:
             return
 
         name = message.from_user.full_name
-        added = await db.add_contact(owner.chat_id, message.from_user.id, name)
+        added = await db.add_contact(owner.chat_id, message.from_user.id, name, db.TELEGRAM)
         if added:
             await message.answer(
                 f"✅ Вы подписались на оповещения от {owner.name}.\n"
@@ -211,23 +228,22 @@ async def cmd_register(message: Message) -> None:
 
     # If no admin configured, or registrant IS the admin — approve immediately
     if not settings.admin_chat_id or chat_id == settings.admin_chat_id:
-        owner = await db.create_owner(chat_id, name, status="active")
-        bot_info = await message.bot.get_me()
-        subscribe_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
+        owner = await db.create_owner(chat_id, name, status="active", platform=db.TELEGRAM)
         webhook_url = f"{settings.base_url}/alice/{owner.webhook_token}"
+        links = await _subscribe_links_text(message.bot, owner)
         await message.answer(
             f"✅ Вы зарегистрированы!\n\n"
             f"<b>Webhook URL для Яндекс Диалогов:</b>\n"
             f"<code>{webhook_url}</code>\n\n"
-            f"<b>Ссылка для друзей:</b>\n"
-            f"{subscribe_link}\n\n"
+            f"<b>Ссылки для друзей:</b>\n"
+            f"{links}\n\n"
             "Скопируйте Webhook URL и вставьте в настройки своего навыка Алисы.\n"
             "Поделитесь ссылкой с друзьями — они подпишутся одним нажатием.",
             parse_mode="HTML",
             reply_markup=_owner_keyboard(),
         )
     else:
-        await db.create_owner(chat_id, name, status="pending")
+        await db.create_owner(chat_id, name, status="pending", platform=db.TELEGRAM)
         await message.answer(
             "⏳ Заявка на регистрацию отправлена администратору.\n"
             "Вы получите уведомление, когда она будет рассмотрена."
@@ -261,22 +277,30 @@ async def callback_approve(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     await db.set_owner_status(chat_id, "active")
-    bot_info = await callback.message.bot.get_me()
-    subscribe_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
     webhook_url = f"{settings.base_url}/alice/{owner.webhook_token}"
     await callback.message.edit_text(f"✅ Одобрено: {owner.name} (id: {chat_id})")
+    # Notify the approved owner on their own platform.
     try:
-        await callback.message.bot.send_message(
-            chat_id,
-            f"✅ Ваша регистрация одобрена!\n\n"
-            f"<b>Webhook URL для Яндекс Диалогов:</b>\n"
-            f"<code>{webhook_url}</code>\n\n"
-            f"<b>Ссылка для друзей:</b>\n"
-            f"{subscribe_link}\n\n"
-            "Используйте кнопки ниже для управления ботом.",
-            parse_mode="HTML",
-            reply_markup=_owner_keyboard(),
-        )
+        if owner.platform == db.MAX:
+            await messaging.send(
+                db.MAX, chat_id,
+                "✅ Ваша регистрация одобрена!\n\n"
+                f"Webhook URL для Яндекс Диалогов:\n{webhook_url}\n\n"
+                "Откройте бота и используйте кнопки для управления.",
+            )
+        else:
+            links = await _subscribe_links_text(callback.message.bot, owner)
+            await callback.message.bot.send_message(
+                chat_id,
+                f"✅ Ваша регистрация одобрена!\n\n"
+                f"<b>Webhook URL для Яндекс Диалогов:</b>\n"
+                f"<code>{webhook_url}</code>\n\n"
+                f"<b>Ссылки для друзей:</b>\n"
+                f"{links}\n\n"
+                "Используйте кнопки ниже для управления ботом.",
+                parse_mode="HTML",
+                reply_markup=_owner_keyboard(),
+            )
     except Exception:
         logger.exception("Failed to notify user %d about approval", chat_id)
     await callback.answer("✅ Одобрено")
@@ -290,11 +314,12 @@ async def callback_reject(callback: CallbackQuery) -> None:
     chat_id = int(callback.data.split(":")[1])
     owner = await db.get_owner(chat_id)
     name = owner.name if owner else str(chat_id)
+    platform = owner.platform if owner else db.TELEGRAM
     await db.delete_owner(chat_id)
     await callback.message.edit_text(f"❌ Отклонено: {name} (id: {chat_id})")
     try:
-        await callback.message.bot.send_message(
-            chat_id,
+        await messaging.send(
+            platform, chat_id,
             "❌ Ваша заявка на регистрацию отклонена администратором.\n"
             "Если считаете это ошибкой — свяжитесь с администратором."
         )
@@ -403,13 +428,14 @@ async def callback_admin_delete_confirm(callback: CallbackQuery) -> None:
     chat_id = int(callback.data.split(":")[1])
     owner = await db.get_owner(chat_id)
     name = owner.name if owner else str(chat_id)
+    platform = owner.platform if owner else db.TELEGRAM
     await db.delete_owner(chat_id)
     await callback.message.edit_text(f"✅ Аккаунт {name} (id: {chat_id}) удалён вместе со всеми данными.")
     try:
-        await callback.message.bot.send_message(
-            chat_id,
+        await messaging.send(
+            platform, chat_id,
             "❌ Ваш аккаунт был удалён администратором.\n"
-            "Для повторной регистрации используйте /register."
+            "Для повторной регистрации откройте бота заново."
         )
     except Exception:
         logger.exception("Failed to notify deleted user %d", chat_id)
@@ -433,9 +459,8 @@ async def cmd_status(message: Message) -> None:
     if not owner:
         return
     contacts = await db.get_contacts(owner.chat_id)
-    bot_info = await message.bot.get_me()
-    subscribe_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
     webhook_url = f"{settings.base_url}/alice/{owner.webhook_token}"
+    links = await _subscribe_links_text(message.bot, owner)
     await message.answer(
         f"📊 <b>Ваши настройки</b>\n\n"
         f"👤 Имя: {owner.name}\n"
@@ -443,7 +468,7 @@ async def cmd_status(message: Message) -> None:
         f"👥 Подписчиков: {len(contacts)}\n\n"
         f"📢 Текст SOS:\n{owner.sos_message}\n\n"
         f"🔗 Webhook: <code>{webhook_url}</code>\n"
-        f"👫 Ссылка для друзей:\n{subscribe_link}",
+        f"👫 Ссылки для друзей:\n{links}",
         parse_mode="HTML",
     )
 
@@ -582,7 +607,7 @@ async def callback_checkin_sos(callback: CallbackQuery) -> None:
     if not owner:
         return
     await callback.message.edit_text("🆘 Отправляю SOS вашим контактам...")
-    sent, failed = await notifier.send_sos(callback.message.bot, owner)
+    sent, failed = await notifier.send_sos(owner)
     await callback.message.answer(
         f"🆘 SOS отправлен!\n✅ Доставлено: {sent}\n❌ Ошибок: {failed}"
     )
@@ -714,20 +739,25 @@ async def cmd_contacts(message: Message) -> None:
         return
     contacts = await db.get_contacts(owner.chat_id)
     if not contacts:
-        bot_info = await message.bot.get_me()
-        subscribe_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
+        links = await _subscribe_links_text(message.bot, owner)
         await message.answer(
-            f"Список контактов пуст.\n\nПоделитесь ссылкой с друзьями:\n{subscribe_link}"
+            f"Список контактов пуст.\n\nПоделитесь ссылками с друзьями:\n{links}"
         )
         return
 
+    def _tag(platform: str) -> str:
+        return "🅼" if platform == db.MAX else "📱"
+
     lines = [f"👥 Подписчики ({len(contacts)}):\n"]
-    for i, (chat_id, name) in enumerate(contacts.items(), 1):
-        lines.append(f"{i}. {name}")
+    for i, c in enumerate(contacts, 1):
+        lines.append(f"{i}. {_tag(c.platform)} {c.name}")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"❌ {name}", callback_data=f"remove:{chat_id}")]
-        for chat_id, name in contacts.items()
+        [InlineKeyboardButton(
+            text=f"❌ {_tag(c.platform)} {c.name}",
+            callback_data=f"remove:{c.platform}:{c.chat_id}",
+        )]
+        for c in contacts
     ])
     await message.answer("\n".join(lines), reply_markup=keyboard)
 
@@ -737,10 +767,11 @@ async def callback_remove_contact(callback: CallbackQuery) -> None:
     owner = await _get_active_owner_cb(callback)
     if not owner:
         return
-    chat_id = int(callback.data.split(":")[1])
+    _, platform, chat_id_str = callback.data.split(":")
+    chat_id = int(chat_id_str)
     contacts = await db.get_contacts(owner.chat_id)
-    name = contacts.get(chat_id, str(chat_id))
-    await db.remove_contact(owner.chat_id, chat_id)
+    name = next((c.name for c in contacts if c.chat_id == chat_id and c.platform == platform), str(chat_id))
+    await db.remove_contact(owner.chat_id, chat_id, platform)
     await callback.answer(f"❌ {name} удалён")
     await callback.message.delete()
 
@@ -751,11 +782,10 @@ async def cmd_mylink(message: Message) -> None:
     owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
         return
-    bot_info = await message.bot.get_me()
-    subscribe_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
+    links = await _subscribe_links_text(message.bot, owner)
     await message.answer(
-        f"Ссылка для подписки на ваши оповещения:\n\n{subscribe_link}\n\n"
-        "Отправьте её друзьям — они подпишутся одним нажатием."
+        f"Ссылки для подписки на ваши оповещения:\n\n{links}\n\n"
+        "Отправьте друзьям ссылку их мессенджера — они подпишутся одним нажатием."
     )
 
 
@@ -771,7 +801,7 @@ async def cmd_test(message: Message) -> None:
         return
     await message.answer("Отправляю тестовый SOS...")
     sent, failed = await notifier.send_sos(
-        message.bot, owner, extra_message="[ТЕСТ — не паникуйте!]"
+        owner, extra_message="[ТЕСТ — не паникуйте!]"
     )
     await message.answer(f"✅ Тест завершён: {sent} доставлено, {failed} ошибок")
 
@@ -795,7 +825,7 @@ async def callback_confirm_sos(callback: CallbackQuery) -> None:
     if not owner:
         return
     await callback.message.edit_text("🆘 Отправляю SOS...")
-    sent, failed = await notifier.send_sos(callback.message.bot, owner)
+    sent, failed = await notifier.send_sos(owner)
     await callback.message.edit_text(
         f"🆘 SOS отправлен!\n✅ Доставлено: {sent}\n❌ Ошибок: {failed}"
     )
@@ -839,7 +869,7 @@ async def cmd_replies(message: Message) -> None:
 @router.message(Command("unsubscribe"))
 @router.message(F.text == "❌ Отписаться")
 async def cmd_unsubscribe(message: Message) -> None:
-    removed = await db.remove_subscriber(message.from_user.id)
+    removed = await db.remove_subscriber(message.from_user.id, db.TELEGRAM)
     if removed:
         await message.answer(
             f"❌ Вы отписались от {removed} оповещений.",
@@ -860,7 +890,7 @@ async def cmd_subscribe_hint(message: Message) -> None:
 
 @router.message(F.text == "📋 Мои подписки")
 async def cmd_my_subscriptions(message: Message) -> None:
-    owners = await db.get_owners_for_contact(message.from_user.id)
+    owners = await db.get_owners_for_contact(message.from_user.id, db.TELEGRAM)
     if not owners:
         await message.answer("Вы не подписаны ни на кого.")
         return
@@ -947,13 +977,13 @@ async def handle_text(message: Message) -> None:
 
     # Forward as subscriber reply to owner(s)
     try:
-        owners = await db.get_owners_for_contact(chat_id)
+        owners = await db.get_owners_for_contact(chat_id, db.TELEGRAM)
         if not owners:
             return
         sender_name = message.from_user.full_name
         text = message.text.strip()
         for owner in owners:
-            await db.add_reply(owner.chat_id, chat_id, sender_name, text)
+            await db.add_reply(owner.chat_id, chat_id, sender_name, text, db.TELEGRAM)
             try:
                 await message.bot.send_message(
                     owner.chat_id,

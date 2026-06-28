@@ -1,32 +1,26 @@
 import logging
 from datetime import datetime, timezone, timedelta
 
-from aiogram import Bot
-
 import db
+import messaging
 
 logger = logging.getLogger(__name__)
 
 
 async def send_sos(
-    bot: Bot,
     owner: db.Owner,
     extra_message: str = "",
-    contact_ids: list[int] | None = None,
+    contacts: list[db.Contact] | None = None,
 ) -> tuple[int, int]:
     """
     Sends SOS on behalf of owner to their contacts.
-    If contact_ids is None, sends to all owner's contacts.
+    Each contact is messaged on its own platform (Telegram or MAX).
+    If ``contacts`` is None, sends to all owner's contacts.
     Returns (sent_count, failed_count).
     """
-    all_contacts = await db.get_contacts(owner.chat_id)
+    targets = contacts if contacts is not None else await db.get_contacts(owner.chat_id)
 
-    if contact_ids is not None:
-        contacts = {cid: all_contacts[cid] for cid in contact_ids if cid in all_contacts}
-    else:
-        contacts = all_contacts
-
-    if not contacts:
+    if not targets:
         logger.warning("SOS triggered by owner %d but no contacts", owner.chat_id)
         return 0, 0
 
@@ -42,17 +36,22 @@ async def send_sos(
 
     sent = 0
     failed = 0
-    for chat_id, name in contacts.items():
+    for contact in targets:
         try:
-            await bot.send_message(chat_id, text)
+            await messaging.send(contact.platform, contact.chat_id, text)
             sent += 1
-            logger.info("SOS sent to %s (%d) for owner %d", name, chat_id, owner.chat_id)
+            logger.info("SOS sent to %s (%d/%s) for owner %d",
+                        contact.name, contact.chat_id, contact.platform, owner.chat_id)
         except Exception as e:
             failed += 1
-            logger.error("Failed SOS to %s (%d): %s", name, chat_id, e)
+            logger.error("Failed SOS to %s (%d/%s): %s",
+                         contact.name, contact.chat_id, contact.platform, e)
 
-    await bot.send_message(
-        owner.chat_id,
-        f"📊 SOS разослан: ✅ {sent} получили, ❌ {failed} ошибок",
-    )
+    try:
+        await messaging.send(
+            owner.platform, owner.chat_id,
+            f"📊 SOS разослан: ✅ {sent} получили, ❌ {failed} ошибок",
+        )
+    except Exception:
+        logger.exception("Failed to send SOS summary to owner %d", owner.chat_id)
     return sent, failed

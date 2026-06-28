@@ -5,16 +5,18 @@ If they don't respond:
   - after 1 hour  → 2nd question
   - after 30 min  → 3rd (final) question
   - after 10 min  → automatic SOS to all contacts
+
+Works for owners on either platform (Telegram or MAX).
 """
 
 import asyncio
 import logging
 import time
 
-from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 import db
+import messaging
 import notifier
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,7 @@ _ASK_TEXTS = {
     ),
 }
 
+# Telegram inline keyboard for the check-in prompt
 CHECKIN_KB = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="✅ Всё хорошо", callback_data="checkin_ok"),
     InlineKeyboardButton(text="🆘 Нужна помощь", callback_data="checkin_sos"),
@@ -70,20 +73,21 @@ async def confirm(owner_id: int) -> bool:
 # Background loop
 # ---------------------------------------------------------------------------
 
-async def run_loop(bot: Bot) -> None:
+async def run_loop() -> None:
     while True:
         try:
-            await _tick(bot)
+            await _tick()
         except Exception:
             logger.exception("checkin tick error")
         await asyncio.sleep(60)
 
 
-async def _tick(bot: Bot) -> None:
+async def _tick() -> None:
     now = int(time.time())
     for row in await db.get_pending_checkins():
         owner_id = row["owner_id"]
         tz_offset = row["tz_offset"]
+        platform = row["platform"]
         state = row["state"]
         last_asked_at = row["last_asked_at"]
         time_minutes = row["time_minutes"]
@@ -94,24 +98,29 @@ async def _tick(bot: Bot) -> None:
             in_window = time_minutes <= local_minute < time_minutes + 2
             not_asked_recently = (now - last_asked_at) > 43200  # >12 h
             if in_window and not_asked_recently:
-                await _ask(bot, owner_id, 1, now)
+                await _ask(platform, owner_id, 1, now)
 
         elif state == "asked_1":
             if now - last_asked_at >= 3600:       # 1 hour
-                await _ask(bot, owner_id, 2, now)
+                await _ask(platform, owner_id, 2, now)
 
         elif state == "asked_2":
             if now - last_asked_at >= 1800:       # 30 min
-                await _ask(bot, owner_id, 3, now)
+                await _ask(platform, owner_id, 3, now)
 
         elif state == "asked_3":
             if now - last_asked_at >= 600:        # 10 min
-                await _auto_sos(bot, owner_id, now)
+                await _auto_sos(owner_id, now)
 
 
-async def _ask(bot: Bot, owner_id: int, attempt: int, now: int) -> None:
+async def _ask(platform: str, owner_id: int, attempt: int, now: int) -> None:
     try:
-        await bot.send_message(owner_id, _ASK_TEXTS[attempt], reply_markup=CHECKIN_KB)
+        if platform == db.MAX:
+            import max_bot
+            await max_bot.send_checkin_prompt(owner_id, _ASK_TEXTS[attempt])
+        else:
+            tg = messaging.get_telegram_bot()
+            await tg.send_message(owner_id, _ASK_TEXTS[attempt], reply_markup=CHECKIN_KB)
         await db.update_checkin(
             owner_id, state=f"asked_{attempt}", attempts=attempt, last_asked_at=now
         )
@@ -120,22 +129,18 @@ async def _ask(bot: Bot, owner_id: int, attempt: int, now: int) -> None:
         logger.exception("checkin: failed to message owner=%d", owner_id)
 
 
-async def _auto_sos(bot: Bot, owner_id: int, now: int) -> None:
+async def _auto_sos(owner_id: int, now: int) -> None:
     owner = await db.get_owner(owner_id)
     if not owner:
         return
     try:
-        await bot.send_message(
-            owner_id,
+        await messaging.send(
+            owner.platform, owner_id,
             "🆘 Вы не ответили на проверку. Отправляю SOS вашим контактам...",
         )
         sent, failed = await notifier.send_sos(
-            bot, owner,
+            owner,
             extra_message="[АВТО-SOS: владелец не ответил на ежедневную проверку]",
-        )
-        await bot.send_message(
-            owner_id,
-            f"📊 SOS отправлен: ✅ {sent} доставлено, ❌ {failed} ошибок",
         )
         logger.info("checkin: auto-SOS owner=%d sent=%d failed=%d", owner_id, sent, failed)
     except Exception:

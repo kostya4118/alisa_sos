@@ -10,6 +10,7 @@ import alice
 import bot as bot_module
 import checkin as checkin_module
 import db
+import messaging
 import migrate
 from config import settings
 
@@ -20,9 +21,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def create_app(telegram_bot: Bot) -> FastAPI:
+def create_app(telegram_bot: Bot, max_bot=None) -> FastAPI:
     app = FastAPI(title="Alisa SOS", docs_url=None, redoc_url=None)
     app.state.bot = telegram_bot
+    app.state.max_bot = max_bot
     app.include_router(alice.router)
 
     @app.get("/health")
@@ -52,27 +54,46 @@ async def run_server(app: FastAPI) -> None:
 async def main() -> None:
     await db.init(settings.db_path)
     await migrate.run()  # no-op if already done or ADMIN_CHAT_ID not set
+
     telegram_bot = Bot(token=settings.telegram_bot_token)
     dp = bot_module.create_dispatcher()
-    app = create_app(telegram_bot)
+    messaging.set_bots(telegram=telegram_bot)
+
+    # Optional MAX messenger bot (enabled only when MAX_BOT_TOKEN is set).
+    max_bot_module = None
+    max_bot_instance = None
+    if settings.max_bot_token:
+        try:
+            import max_bot as max_bot_module
+            max_bot_instance = max_bot_module.create_bot()
+            messaging.set_bots(max=max_bot_instance)
+            logger.info("MAX bot enabled.")
+        except Exception:
+            logger.exception("Failed to initialise MAX bot — continuing without it")
+            max_bot_module = None
+            max_bot_instance = None
+
+    app = create_app(telegram_bot, max_bot_instance)
 
     loop = asyncio.get_running_loop()
-
-    polling_task = loop.create_task(run_bot(dp, telegram_bot))
-    server_task = loop.create_task(run_server(app))
-    checkin_task = loop.create_task(checkin_module.run_loop(telegram_bot))
+    tasks = [
+        loop.create_task(run_bot(dp, telegram_bot)),
+        loop.create_task(run_server(app)),
+        loop.create_task(checkin_module.run_loop()),
+    ]
+    if max_bot_module is not None:
+        tasks.append(loop.create_task(max_bot_module.run_polling()))
 
     def _stop(sig, frame):  # noqa: ARG001
         logger.info("Shutting down...")
-        polling_task.cancel()
-        server_task.cancel()
-        checkin_task.cancel()
+        for t in tasks:
+            t.cancel()
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
     try:
-        await asyncio.gather(polling_task, server_task, checkin_task)
+        await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         pass
     finally:

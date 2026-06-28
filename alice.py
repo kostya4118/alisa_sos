@@ -10,10 +10,10 @@ owner's Yandex Dialogs skill settings as the Webhook URL.
 
 import logging
 
-from aiogram import Bot
 from fastapi import APIRouter, HTTPException, Request
 
 import db
+import messaging
 import notifier
 
 logger = logging.getLogger(__name__)
@@ -41,17 +41,17 @@ def _norm(s: str) -> str:
     return ''.join(_LAT_TO_CYR.get(ch, ch) for ch in s.lower())
 
 
-def _find_contact(query: str, contacts: dict[int, str]) -> tuple[int, str] | None:
+def _find_contact(query: str, contacts: list[db.Contact]) -> db.Contact | None:
     q = _norm(query.strip())
-    for chat_id, name in contacts.items():
-        parts = [_norm(p) for p in name.split()]
-        if q == _norm(name) or q in parts or any(p.startswith(q) for p in parts):
-            return chat_id, name
+    for c in contacts:
+        parts = [_norm(p) for p in c.name.split()]
+        if q == _norm(c.name) or q in parts or any(p.startswith(q) for p in parts):
+            return c
     return None
 
 
-def _contact_first_names(contacts: dict[int, str]) -> str:
-    return ", ".join(name.split()[0] for name in contacts.values())
+def _contact_first_names(contacts: list[db.Contact]) -> str:
+    return ", ".join(c.first_name() for c in contacts)
 
 
 def _alice_response(text: str, *, end_session: bool = False, buttons: list[str] | None = None) -> dict:
@@ -79,7 +79,6 @@ async def alice_webhook(webhook_token: str, request: Request):
             end_session=True,
         )
 
-    bot: Bot = request.app.state.bot
     body: dict = await request.json()
 
     session = body.get("session", {})
@@ -158,28 +157,34 @@ async def alice_webhook(webhook_token: str, request: Request):
             parts = [f"{r['contact_name']} написал: {r['text']}" for r in replies]
             replies_text = ". ".join(parts)
 
-            # Unique senders (preserving order)
+            # Unique senders (preserving order), keyed by (contact_id, platform)
             seen: set = set()
-            unique_senders: dict[int, str] = {}
+            unique_senders: list[dict] = []
             for r in replies:
-                if r["contact_id"] not in seen:
-                    seen.add(r["contact_id"])
-                    unique_senders[r["contact_id"]] = r["contact_name"]
+                key = (r["contact_id"], r["platform"])
+                if key not in seen:
+                    seen.add(key)
+                    unique_senders.append({
+                        "contact_id": r["contact_id"],
+                        "name": r["contact_name"],
+                        "platform": r["platform"],
+                    })
 
             if len(unique_senders) == 1:
-                cid, cname = next(iter(unique_senders.items()))
+                s = unique_senders[0]
                 _sessions[session_id] = {
                     "state": "awaiting_reply_text",
                     "owner_id": owner.chat_id,
-                    "reply_contact_id": cid,
-                    "reply_contact_name": cname,
+                    "reply_contact_id": s["contact_id"],
+                    "reply_contact_name": s["name"],
+                    "reply_platform": s["platform"],
                 }
                 return _alice_response(
-                    f"{replies_text}. Хотите ответить {cname}? Скажите что передать или 'пропустить'.",
+                    f"{replies_text}. Хотите ответить {s['name']}? Скажите что передать или 'пропустить'.",
                     buttons=["Пропустить"],
                 )
             else:
-                names = ", ".join(unique_senders.values())
+                names = ", ".join(s["name"] for s in unique_senders)
                 _sessions[session_id] = {
                     "state": "awaiting_reply_name",
                     "owner_id": owner.chat_id,
@@ -195,23 +200,27 @@ async def alice_webhook(webhook_token: str, request: Request):
         return await _go_to_next()
 
     if state == "awaiting_reply_name":
-        senders: dict[int, str] = state_data.get("senders", {})
+        senders: list[dict] = state_data.get("senders", [])
 
         if _has(_SKIP_WORDS) or _has(_CANCEL_WORDS):
             return await _go_to_next()
 
-        match = _find_contact(utterance or command, senders)
+        sender_contacts = [
+            db.Contact(chat_id=s["contact_id"], name=s["name"], platform=s["platform"])
+            for s in senders
+        ]
+        match = _find_contact(utterance or command, sender_contacts)
         if match:
-            cid, cname = match
             _sessions[session_id] = {
                 "state": "awaiting_reply_text",
                 "owner_id": owner.chat_id,
-                "reply_contact_id": cid,
-                "reply_contact_name": cname,
+                "reply_contact_id": match.chat_id,
+                "reply_contact_name": match.name,
+                "reply_platform": match.platform,
             }
-            return _alice_response(f"Что передать {cname}?")
+            return _alice_response(f"Что передать {match.name}?")
 
-        names = ", ".join(senders.values())
+        names = ", ".join(s["name"] for s in senders)
         return _alice_response(
             f"Не нашла такого имени. Скажите кому ответить или 'пропустить'. Писали: {names}.",
             buttons=["Пропустить"],
@@ -220,6 +229,7 @@ async def alice_webhook(webhook_token: str, request: Request):
     if state == "awaiting_reply_text":
         cid: int = state_data["reply_contact_id"]
         cname: str = state_data["reply_contact_name"]
+        cplatform: str = state_data.get("reply_platform", db.TELEGRAM)
 
         if _has(_SKIP_WORDS) or _has(_CANCEL_WORDS):
             return await _go_to_next()
@@ -227,7 +237,7 @@ async def alice_webhook(webhook_token: str, request: Request):
         reply_text = utterance or command
         sent_ok = False
         try:
-            await bot.send_message(cid, f"💬 {owner.name}: {reply_text}")
+            await messaging.send(cplatform, cid, f"💬 {owner.name}: {reply_text}")
             sent_ok = True
         except Exception:
             logger.exception("Failed to send reply to contact %d", cid)
@@ -241,7 +251,7 @@ async def alice_webhook(webhook_token: str, request: Request):
             return _alice_response("Отменено. Будьте в безопасности.", end_session=True)
 
         if _has(_ALL_WORDS) or _has(_CONFIRM_WORDS):
-            _sessions[session_id] = {"state": "awaiting_message", "owner_id": owner.chat_id, "recipient_ids": None}
+            _sessions[session_id] = {"state": "awaiting_message", "owner_id": owner.chat_id, "recipient": None}
             return _alice_response(
                 "Отправляю всем. Хотите добавить сообщение? Скажите что передать или 'всё'.",
                 buttons=["Всё"],
@@ -257,14 +267,14 @@ async def alice_webhook(webhook_token: str, request: Request):
         contacts = await db.get_contacts(owner.chat_id)
         match = _find_contact(utterance or command, contacts)
         if match:
-            chat_id, name = match
             _sessions[session_id] = {
                 "state": "awaiting_specific_confirmation",
                 "owner_id": owner.chat_id,
-                "recipient_id": chat_id,
-                "recipient_name": name,
+                "recipient_id": match.chat_id,
+                "recipient_name": match.name,
+                "recipient_platform": match.platform,
             }
-            return _alice_response(f"Отправить SOS контакту {name}?", buttons=["Да", "Нет"])
+            return _alice_response(f"Отправить SOS контакту {match.name}?", buttons=["Да", "Нет"])
 
         return _alice_response(
             "Скажите 'всем' чтобы оповестить всех, или 'одному' чтобы выбрать человека.",
@@ -279,14 +289,14 @@ async def alice_webhook(webhook_token: str, request: Request):
         contacts = await db.get_contacts(owner.chat_id)
         match = _find_contact(utterance or command, contacts)
         if match:
-            chat_id, name = match
             _sessions[session_id] = {
                 "state": "awaiting_specific_confirmation",
                 "owner_id": owner.chat_id,
-                "recipient_id": chat_id,
-                "recipient_name": name,
+                "recipient_id": match.chat_id,
+                "recipient_name": match.name,
+                "recipient_platform": match.platform,
             }
-            return _alice_response(f"Отправить SOS контакту {name}?", buttons=["Да", "Нет"])
+            return _alice_response(f"Отправить SOS контакту {match.name}?", buttons=["Да", "Нет"])
 
         return _alice_response(
             f"Не нашла такого контакта. Попробуйте ещё раз. "
@@ -304,7 +314,11 @@ async def alice_webhook(webhook_token: str, request: Request):
             _sessions[session_id] = {
                 "state": "awaiting_message",
                 "owner_id": owner.chat_id,
-                "recipient_ids": [state_data["recipient_id"]],
+                "recipient": {
+                    "chat_id": state_data["recipient_id"],
+                    "name": name,
+                    "platform": state_data.get("recipient_platform", db.TELEGRAM),
+                },
                 "recipient_name": name,
             }
             return _alice_response(
@@ -322,8 +336,15 @@ async def alice_webhook(webhook_token: str, request: Request):
         if not _has(_DONE_WORDS):
             extra = utterance or command
 
-        recipient_ids: list[int] | None = state_data.get("recipient_ids")
-        sent, failed = await notifier.send_sos(bot, owner, extra_message=extra, contact_ids=recipient_ids)
+        recipient: dict | None = state_data.get("recipient")
+        contacts_subset = None
+        if recipient is not None:
+            contacts_subset = [db.Contact(
+                chat_id=recipient["chat_id"],
+                name=recipient["name"],
+                platform=recipient["platform"],
+            )]
+        sent, failed = await notifier.send_sos(owner, extra_message=extra, contacts=contacts_subset)
         _sessions.pop(session_id, None)
 
         if sent == 0:
