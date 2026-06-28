@@ -93,6 +93,18 @@ async def alice_webhook(webhook_token: str, request: Request):
                 "Список контактов пуст. Добавьте контакты через Telegram бота.",
                 end_session=True,
             )
+        replies = await db.get_unread_replies(owner.chat_id)
+        if replies:
+            _sessions[session_id] = {
+                "state": "awaiting_read_replies",
+                "owner_id": owner.chat_id,
+                "replies": replies,
+            }
+            word = "ответ" if len(replies) == 1 else ("ответа" if len(replies) < 5 else "ответов")
+            return _alice_response(
+                f"Есть {len(replies)} новых {word} от ваших контактов. Зачитать?",
+                buttons=["Да", "Нет"],
+            )
         count = len(contacts)
         _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
         buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
@@ -104,6 +116,32 @@ async def alice_webhook(webhook_token: str, request: Request):
 
     state_data = _sessions.get(session_id, {"state": "awaiting_recipient", "owner_id": owner.chat_id})
     state = state_data["state"]
+
+    if state == "awaiting_read_replies":
+        replies = state_data.get("replies", [])
+        contacts = await db.get_contacts(owner.chat_id)
+        count = len(contacts)
+        buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
+        sos_prompt = (
+            f"Навык экстренного оповещения. "
+            f"Отправить SOS всем {count} контактам или одному?"
+        )
+
+        if _has(_CONFIRM_WORDS):
+            await db.mark_replies_read(owner.chat_id)
+            parts = []
+            for r in replies:
+                parts.append(f"{r['contact_name']} написал: {r['text']}")
+            replies_text = ". ".join(parts)
+            _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
+            return _alice_response(
+                f"{replies_text}. {sos_prompt}",
+                buttons=buttons,
+            )
+
+        # "нет" or anything else — skip replies, go to SOS
+        _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
+        return _alice_response(sos_prompt, buttons=buttons)
 
     if state == "awaiting_recipient":
         if _has(_CANCEL_WORDS):

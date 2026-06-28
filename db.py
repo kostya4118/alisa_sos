@@ -1,3 +1,4 @@
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -36,6 +37,15 @@ async def init(path: str) -> None:
             UNIQUE(owner_id, chat_id)
         );
         CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_id);
+        CREATE TABLE IF NOT EXISTS replies (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id     INTEGER NOT NULL REFERENCES owners(chat_id) ON DELETE CASCADE,
+            contact_id   INTEGER NOT NULL,
+            contact_name TEXT    NOT NULL,
+            text         TEXT    NOT NULL,
+            created_at   INTEGER NOT NULL,
+            read         INTEGER NOT NULL DEFAULT 0
+        );
     """)
     await _conn.commit()
 
@@ -156,3 +166,37 @@ async def contact_exists(owner_id: int, chat_id: int) -> bool:
         (owner_id, chat_id),
     ) as cur:
         return await cur.fetchone() is not None
+
+
+async def get_owners_for_contact(contact_id: int) -> list[Owner]:
+    """Return all owners who have this chat_id in their contacts list."""
+    async with _conn_or_error().execute(
+        "SELECT o.* FROM owners o JOIN contacts c ON c.owner_id = o.chat_id WHERE c.chat_id = ?",
+        (contact_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_owner(row) for row in rows]
+
+
+async def add_reply(owner_id: int, contact_id: int, contact_name: str, text: str) -> None:
+    conn = _conn_or_error()
+    await conn.execute(
+        "INSERT INTO replies(owner_id, contact_id, contact_name, text, created_at) VALUES (?, ?, ?, ?, ?)",
+        (owner_id, contact_id, contact_name, text, int(time.time())),
+    )
+    await conn.commit()
+
+
+async def get_unread_replies(owner_id: int) -> list[dict]:
+    async with _conn_or_error().execute(
+        "SELECT contact_name, text FROM replies WHERE owner_id = ? AND read = 0 ORDER BY created_at",
+        (owner_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [{"contact_name": row["contact_name"], "text": row["text"]} for row in rows]
+
+
+async def mark_replies_read(owner_id: int) -> None:
+    conn = _conn_or_error()
+    await conn.execute("UPDATE replies SET read = 1 WHERE owner_id = ? AND read = 0", (owner_id,))
+    await conn.commit()

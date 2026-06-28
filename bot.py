@@ -374,6 +374,56 @@ async def cmd_subscribe_hint(message: Message) -> None:
     )
 
 
+@router.message(F.text == "📋 Мои подписки")
+async def cmd_my_subscriptions(message: Message) -> None:
+    owners = await db.get_owners_for_contact(message.from_user.id)
+    if not owners:
+        await message.answer("Вы не подписаны ни на кого.\nДля отписки от всех: /unsubscribe")
+        return
+    lines = ["📋 Ваши подписки:\n"]
+    for i, owner in enumerate(owners, 1):
+        lines.append(f"{i}. {owner.name}")
+    lines.append("\nДля отписки от всех: /unsubscribe")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("replies"))
+async def cmd_replies(message: Message) -> None:
+    owner = await db.get_owner(message.from_user.id)
+    if not owner:
+        await message.answer("Вы не зарегистрированы. Используйте /register")
+        return
+    replies = await db.get_unread_replies(owner.chat_id)
+    if not replies:
+        await message.answer("Нет новых ответов от контактов.")
+        return
+    lines = [f"📬 Новые ответы ({len(replies)}):\n"]
+    for r in replies:
+        lines.append(f"👤 {r['contact_name']}:\n{r['text']}\n")
+    await message.answer("\n".join(lines))
+    await db.mark_replies_read(owner.chat_id)
+
+
+@router.message(F.text & ~F.text.startswith("/"))
+async def handle_subscriber_reply(message: Message) -> None:
+    """Forward any plain text message from a subscriber to their owner(s)."""
+    owners = await db.get_owners_for_contact(message.from_user.id)
+    if not owners:
+        return
+    sender_name = message.from_user.full_name
+    text = message.text.strip()
+    for owner in owners:
+        await db.add_reply(owner.chat_id, message.from_user.id, sender_name, text)
+        try:
+            await message.bot.send_message(
+                owner.chat_id,
+                f"💬 Ответ от {sender_name}:\n{text}",
+            )
+        except Exception:
+            logger.exception("Failed to forward reply to owner %d", owner.chat_id)
+    await message.answer("✅ Ваш ответ отправлен.")
+
+
 def create_dispatcher() -> Dispatcher:
     dp = Dispatcher()
     dp.include_router(router)
