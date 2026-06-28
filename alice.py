@@ -87,6 +87,29 @@ async def alice_webhook(webhook_token: str, request: Request):
     def _has(words: set) -> bool:
         return any(w in command or w in utterance for w in words)
 
+    async def _go_to_next(prefix: str = "") -> dict:
+        """Check for unread replies; announce them or fall through to SOS prompt."""
+        fresh = await db.get_unread_replies(owner.chat_id)
+        if fresh:
+            _sessions[session_id] = {
+                "state": "awaiting_read_replies",
+                "owner_id": owner.chat_id,
+                "replies": fresh,
+            }
+            n = len(fresh)
+            word = "ответ" if n == 1 else ("ответа" if n < 5 else "ответов")
+            return _alice_response(
+                f"{prefix}Есть {n} новых {word}. Зачитать?",
+                buttons=["Да", "Нет"],
+            )
+        cnt = len(await db.get_contacts(owner.chat_id))
+        sos_btns = ["Всем", "Одному"] if cnt > 1 else ["Да"]
+        _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
+        return _alice_response(
+            f"{prefix}Отправить SOS всем {cnt} контактам или одному?",
+            buttons=sos_btns,
+        )
+
     if is_new_session:
         contacts = await db.get_contacts(owner.chat_id)
         if not contacts:
@@ -124,10 +147,6 @@ async def alice_webhook(webhook_token: str, request: Request):
 
     if state == "awaiting_read_replies":
         replies = state_data.get("replies", [])
-        contacts = await db.get_contacts(owner.chat_id)
-        count = len(contacts)
-        sos_buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
-        sos_prompt = f"Отправить SOS всем {count} контактам или одному?"
 
         if _has(_CONFIRM_WORDS):
             await db.mark_replies_read(owner.chat_id)
@@ -166,20 +185,15 @@ async def alice_webhook(webhook_token: str, request: Request):
                     buttons=["Пропустить"],
                 )
 
-        # "нет" or anything else — skip replies, go to SOS
-        _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-        return _alice_response(sos_prompt, buttons=sos_buttons)
+        # "нет" or anything else — mark as read, check for fresh ones, then SOS
+        await db.mark_replies_read(owner.chat_id)
+        return await _go_to_next()
 
     if state == "awaiting_reply_name":
         senders: dict[int, str] = state_data.get("senders", {})
-        contacts = await db.get_contacts(owner.chat_id)
-        count = len(contacts)
-        sos_buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
-        sos_prompt = f"Отправить SOS всем {count} контактам или одному?"
 
         if _has(_SKIP_WORDS) or _has(_CANCEL_WORDS):
-            _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-            return _alice_response(sos_prompt, buttons=sos_buttons)
+            return await _go_to_next()
 
         match = _find_contact(utterance or command, senders)
         if match:
@@ -201,14 +215,9 @@ async def alice_webhook(webhook_token: str, request: Request):
     if state == "awaiting_reply_text":
         cid: int = state_data["reply_contact_id"]
         cname: str = state_data["reply_contact_name"]
-        contacts = await db.get_contacts(owner.chat_id)
-        count = len(contacts)
-        sos_buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
-        sos_prompt = f"Отправить SOS всем {count} контактам или одному?"
 
         if _has(_SKIP_WORDS) or _has(_CANCEL_WORDS):
-            _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-            return _alice_response(sos_prompt, buttons=sos_buttons)
+            return await _go_to_next()
 
         reply_text = utterance or command
         sent_ok = False
@@ -219,22 +228,7 @@ async def alice_webhook(webhook_token: str, request: Request):
             logger.exception("Failed to send reply to contact %d", cid)
 
         prefix = f"Ответ отправлен {cname}. " if sent_ok else "Не удалось отправить ответ. "
-
-        new_replies = await db.get_unread_replies(owner.chat_id)
-        if new_replies:
-            _sessions[session_id] = {
-                "state": "awaiting_read_replies",
-                "owner_id": owner.chat_id,
-                "replies": new_replies,
-            }
-            word = "ответ" if len(new_replies) == 1 else ("ответа" if len(new_replies) < 5 else "ответов")
-            return _alice_response(
-                f"{prefix}Есть ещё {len(new_replies)} новых {word}. Зачитать?",
-                buttons=["Да", "Нет"],
-            )
-
-        _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-        return _alice_response(f"{prefix}{sos_prompt}", buttons=sos_buttons)
+        return await _go_to_next(prefix)
 
     if state == "awaiting_recipient":
         if _has(_CANCEL_WORDS):
