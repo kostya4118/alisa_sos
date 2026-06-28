@@ -9,6 +9,7 @@ from fastapi import FastAPI
 import alice
 import bot as bot_module
 import db
+import migrate
 from config import settings
 
 logging.basicConfig(
@@ -49,6 +50,7 @@ async def run_server(app: FastAPI) -> None:
 
 async def main() -> None:
     await db.init(settings.db_path)
+    await migrate.run()  # no-op if already done or ADMIN_CHAT_ID not set
     telegram_bot = Bot(token=settings.telegram_bot_token)
     dp = bot_module.create_dispatcher()
     app = create_app(telegram_bot)
