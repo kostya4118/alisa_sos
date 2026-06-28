@@ -200,7 +200,7 @@ async def _register(chat_id: int, name: str) -> None:
             "Поделитесь ссылкой для друзей из меню.",
             _menu_kb(),
         )
-        await _send(chat_id, guide.alice_setup_instructions())
+        await _send(chat_id, guide.alice_skill_setup(webhook_url))
         return
 
     # Admin gate: create pending, notify admin (on Telegram).
@@ -224,7 +224,7 @@ async def _register(chat_id: int, name: str) -> None:
             f"Webhook URL для Яндекс Диалогов:\n{webhook_url}",
             _menu_kb(),
         )
-        await _send(chat_id, guide.alice_setup_instructions())
+        await _send(chat_id, guide.alice_skill_setup(webhook_url))
 
 
 async def _subscribe(chat_id: int, name: str, token: str) -> None:

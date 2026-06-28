@@ -242,7 +242,7 @@ async def cmd_register(message: Message) -> None:
             parse_mode="HTML",
             reply_markup=_owner_keyboard(),
         )
-        await message.answer(guide.alice_setup_instructions())
+        await message.answer(guide.alice_skill_setup(webhook_url))
     else:
         await db.create_owner(chat_id, name, status="pending", platform=db.TELEGRAM)
         await message.answer(
@@ -289,7 +289,7 @@ async def callback_approve(callback: CallbackQuery) -> None:
                 f"Webhook URL для Яндекс Диалогов:\n{webhook_url}\n\n"
                 "Откройте бота и используйте кнопки для управления.",
             )
-            await messaging.send(db.MAX, chat_id, guide.alice_setup_instructions())
+            await messaging.send(db.MAX, chat_id, guide.alice_skill_setup(webhook_url))
         else:
             links = await _subscribe_links_text(callback.message.bot, owner)
             await callback.message.bot.send_message(
@@ -303,7 +303,7 @@ async def callback_approve(callback: CallbackQuery) -> None:
                 parse_mode="HTML",
                 reply_markup=_owner_keyboard(),
             )
-            await callback.message.bot.send_message(chat_id, guide.alice_setup_instructions())
+            await callback.message.bot.send_message(chat_id, guide.alice_skill_setup(webhook_url))
     except Exception:
         logger.exception("Failed to notify user %d about approval", chat_id)
     await callback.answer("✅ Одобрено")
