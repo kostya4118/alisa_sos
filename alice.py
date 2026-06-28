@@ -24,6 +24,7 @@ _CANCEL_WORDS = {"нет", "отмена", "cancel", "стоп", "не надо"
 _DONE_WORDS = {"всё", "все", "готово", "достаточно", "хватит", "ладно", "закончить"}
 _ALL_WORDS = {"всем", "всё", "все", "всем контактам"}
 _SPECIFIC_WORDS = {"конкретному", "одному", "выбрать", "определённому"}
+_SKIP_WORDS = {"пропустить", "пропусти", "дальше", "пропускаю", "skip"}
 
 _sessions: dict[str, dict] = {}
 
@@ -125,27 +126,97 @@ async def alice_webhook(webhook_token: str, request: Request):
         replies = state_data.get("replies", [])
         contacts = await db.get_contacts(owner.chat_id)
         count = len(contacts)
-        buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
-        sos_prompt = (
-            f"Навык экстренного оповещения. "
-            f"Отправить SOS всем {count} контактам или одному?"
-        )
+        sos_buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
+        sos_prompt = f"Отправить SOS всем {count} контактам или одному?"
 
         if _has(_CONFIRM_WORDS):
             await db.mark_replies_read(owner.chat_id)
-            parts = []
-            for r in replies:
-                parts.append(f"{r['contact_name']} написал: {r['text']}")
+            parts = [f"{r['contact_name']} написал: {r['text']}" for r in replies]
             replies_text = ". ".join(parts)
-            _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-            return _alice_response(
-                f"{replies_text}. {sos_prompt}",
-                buttons=buttons,
-            )
+
+            # Unique senders (preserving order)
+            seen: set = set()
+            unique_senders: dict[int, str] = {}
+            for r in replies:
+                if r["contact_id"] not in seen:
+                    seen.add(r["contact_id"])
+                    unique_senders[r["contact_id"]] = r["contact_name"]
+
+            if len(unique_senders) == 1:
+                cid, cname = next(iter(unique_senders.items()))
+                _sessions[session_id] = {
+                    "state": "awaiting_reply_text",
+                    "owner_id": owner.chat_id,
+                    "reply_contact_id": cid,
+                    "reply_contact_name": cname,
+                }
+                return _alice_response(
+                    f"{replies_text}. Хотите ответить {cname}? Скажите что передать или 'пропустить'.",
+                    buttons=["Пропустить"],
+                )
+            else:
+                names = ", ".join(unique_senders.values())
+                _sessions[session_id] = {
+                    "state": "awaiting_reply_name",
+                    "owner_id": owner.chat_id,
+                    "senders": unique_senders,
+                }
+                return _alice_response(
+                    f"{replies_text}. Хотите ответить? Назовите имя или скажите 'пропустить'. Писали: {names}.",
+                    buttons=["Пропустить"],
+                )
 
         # "нет" or anything else — skip replies, go to SOS
         _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-        return _alice_response(sos_prompt, buttons=buttons)
+        return _alice_response(sos_prompt, buttons=sos_buttons)
+
+    if state == "awaiting_reply_name":
+        senders: dict[int, str] = state_data.get("senders", {})
+        contacts = await db.get_contacts(owner.chat_id)
+        count = len(contacts)
+        sos_buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
+        sos_prompt = f"Отправить SOS всем {count} контактам или одному?"
+
+        if _has(_SKIP_WORDS) or _has(_CANCEL_WORDS):
+            _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
+            return _alice_response(sos_prompt, buttons=sos_buttons)
+
+        match = _find_contact(utterance or command, senders)
+        if match:
+            cid, cname = match
+            _sessions[session_id] = {
+                "state": "awaiting_reply_text",
+                "owner_id": owner.chat_id,
+                "reply_contact_id": cid,
+                "reply_contact_name": cname,
+            }
+            return _alice_response(f"Что передать {cname}?")
+
+        names = ", ".join(senders.values())
+        return _alice_response(
+            f"Не нашла такого имени. Скажите кому ответить или 'пропустить'. Писали: {names}.",
+            buttons=["Пропустить"],
+        )
+
+    if state == "awaiting_reply_text":
+        cid: int = state_data["reply_contact_id"]
+        cname: str = state_data["reply_contact_name"]
+        contacts = await db.get_contacts(owner.chat_id)
+        count = len(contacts)
+        sos_buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
+        sos_prompt = f"Отправить SOS всем {count} контактам или одному?"
+        _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
+
+        if _has(_SKIP_WORDS) or _has(_CANCEL_WORDS):
+            return _alice_response(sos_prompt, buttons=sos_buttons)
+
+        reply_text = utterance or command
+        try:
+            await bot.send_message(cid, f"💬 {owner.name}: {reply_text}")
+            return _alice_response(f"Ответ отправлен {cname}. {sos_prompt}", buttons=sos_buttons)
+        except Exception:
+            logger.exception("Failed to send reply to contact %d", cid)
+            return _alice_response(f"Не удалось отправить. {sos_prompt}", buttons=sos_buttons)
 
     if state == "awaiting_recipient":
         if _has(_CANCEL_WORDS):

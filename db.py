@@ -189,11 +189,11 @@ async def add_reply(owner_id: int, contact_id: int, contact_name: str, text: str
 
 async def get_unread_replies(owner_id: int) -> list[dict]:
     async with _conn_or_error().execute(
-        "SELECT contact_name, text FROM replies WHERE owner_id = ? AND read = 0 ORDER BY created_at",
+        "SELECT contact_id, contact_name, text FROM replies WHERE owner_id = ? AND read = 0 ORDER BY created_at",
         (owner_id,),
     ) as cur:
         rows = await cur.fetchall()
-    return [{"contact_name": row["contact_name"], "text": row["text"]} for row in rows]
+    return [{"contact_id": row["contact_id"], "contact_name": row["contact_name"], "text": row["text"]} for row in rows]
 
 
 async def mark_replies_read(owner_id: int) -> None:
