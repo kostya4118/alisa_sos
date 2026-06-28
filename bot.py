@@ -21,6 +21,9 @@ from config import settings
 logger = logging.getLogger(__name__)
 router = Router()
 
+# chat_id → "set_name" | "set_message" | "set_tz"
+_pending_state: dict[int, str] = {}
+
 
 # ---------------------------------------------------------------------------
 # Keyboards
@@ -30,7 +33,9 @@ def _owner_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👥 Контакты"), KeyboardButton(text="🆘 Тест SOS")],
+            [KeyboardButton(text="📬 Ответы"), KeyboardButton(text="🚨 Отправить SOS")],
             [KeyboardButton(text="🔗 Ссылка для друзей"), KeyboardButton(text="📊 Статус")],
+            [KeyboardButton(text="⚙️ Настройки")],
         ],
         resize_keyboard=True,
     )
@@ -38,9 +43,26 @@ def _owner_keyboard() -> ReplyKeyboardMarkup:
 
 def _subscribe_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📋 Мои подписки")]],
+        keyboard=[
+            [KeyboardButton(text="📋 Мои подписки"), KeyboardButton(text="❌ Отписаться")],
+        ],
         resize_keyboard=True,
     )
+
+
+def _settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить имя", callback_data="cfg_name")],
+        [InlineKeyboardButton(text="📝 Изменить текст SOS", callback_data="cfg_message")],
+        [InlineKeyboardButton(text="🕐 Изменить часовой пояс", callback_data="cfg_tz")],
+        [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data="cfg_delete")],
+    ])
+
+
+def _cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Отмена", callback_data="cfg_cancel"),
+    ]])
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +91,7 @@ async def cmd_start(message: Message) -> None:
             await message.answer(
                 f"✅ Вы подписались на оповещения от {owner.name}.\n"
                 "Если владелец активирует SOS через Алису — вы получите сообщение.\n\n"
-                "Для отписки: /unsubscribe",
+                "Напишите боту что угодно — и ваш ответ будет передан владельцу.",
                 reply_markup=_subscribe_keyboard(),
             )
             await message.bot.send_message(
@@ -77,7 +99,10 @@ async def cmd_start(message: Message) -> None:
                 f"👤 Новый подписчик: {name} (id: {message.from_user.id})",
             )
         else:
-            await message.answer(f"Вы уже подписаны на оповещения от {owner.name}.\nДля отписки: /unsubscribe")
+            await message.answer(
+                f"Вы уже подписаны на оповещения от {owner.name}.",
+                reply_markup=_subscribe_keyboard(),
+            )
         return
 
     # Regular /start — check if user is already an owner
@@ -92,7 +117,7 @@ async def cmd_start(message: Message) -> None:
         await message.answer(
             f"👋 Привет, {message.from_user.first_name}!\n\n"
             "Это сервис экстренного оповещения через Яндекс Алису.\n\n"
-            "Если вы хотите настроить бота для себя — зарегистрируйтесь:\n"
+            "Если вы хотите настроить бота для себя — нажмите:\n"
             "/register\n\n"
             "Если вы получили ссылку от друга — перейдите по ней, чтобы подписаться.",
             reply_markup=ReplyKeyboardRemove(),
@@ -100,7 +125,7 @@ async def cmd_start(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Owner registration & settings
+# Owner registration
 # ---------------------------------------------------------------------------
 
 @router.message(Command("register"))
@@ -108,9 +133,8 @@ async def cmd_register(message: Message) -> None:
     existing = await db.get_owner(message.from_user.id)
     if existing:
         await message.answer(
-            f"Вы уже зарегистрированы как {existing.name}.\n"
-            f"Ваш webhook: {settings.base_url}/alice/{existing.webhook_token}\n\n"
-            "Используйте /settings чтобы посмотреть все настройки.",
+            f"Вы уже зарегистрированы как {existing.name}.\n\n"
+            "Используйте кнопку «📊 Статус» чтобы посмотреть все настройки.",
             reply_markup=_owner_keyboard(),
         )
         return
@@ -127,17 +151,19 @@ async def cmd_register(message: Message) -> None:
         f"<b>Ссылка для друзей:</b>\n"
         f"{subscribe_link}\n\n"
         "Скопируйте Webhook URL и вставьте в настройки своего навыка Алисы.\n"
-        "Поделитесь ссылкой с друзьями — они подпишутся одним нажатием.\n\n"
-        "Настройки: /setname, /setmessage, /settz\n"
-        "Удалить аккаунт: /deleteaccount",
+        "Поделитесь ссылкой с друзьями — они подпишутся одним нажатием.",
         parse_mode="HTML",
         reply_markup=_owner_keyboard(),
     )
 
 
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+
 @router.message(Command("settings"))
 @router.message(F.text == "📊 Статус")
-async def cmd_settings(message: Message) -> None:
+async def cmd_status(message: Message) -> None:
     owner = await db.get_owner(message.from_user.id)
     if not owner:
         await message.answer("Вы не зарегистрированы. Используйте /register")
@@ -157,6 +183,94 @@ async def cmd_settings(message: Message) -> None:
         parse_mode="HTML",
     )
 
+
+# ---------------------------------------------------------------------------
+# Settings menu (edit)
+# ---------------------------------------------------------------------------
+
+@router.message(F.text == "⚙️ Настройки")
+async def cmd_settings_menu(message: Message) -> None:
+    owner = await db.get_owner(message.from_user.id)
+    if not owner:
+        await message.answer("Вы не зарегистрированы. Используйте /register")
+        return
+    await message.answer(
+        f"⚙️ <b>Редактирование настроек</b>\n\n"
+        f"👤 Имя: {owner.name}\n"
+        f"🕐 Часовой пояс: UTC{owner.tz_offset:+d}\n"
+        f"📢 Текст SOS:\n{owner.sos_message}",
+        parse_mode="HTML",
+        reply_markup=_settings_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "cfg_name")
+async def callback_cfg_name(callback: CallbackQuery) -> None:
+    if not await db.get_owner(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    _pending_state[callback.from_user.id] = "set_name"
+    await callback.message.answer("✏️ Введите новое имя:", reply_markup=_cancel_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cfg_message")
+async def callback_cfg_message(callback: CallbackQuery) -> None:
+    if not await db.get_owner(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    _pending_state[callback.from_user.id] = "set_message"
+    await callback.message.answer(
+        "📝 Введите новый текст SOS-сообщения:",
+        reply_markup=_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cfg_tz")
+async def callback_cfg_tz(callback: CallbackQuery) -> None:
+    if not await db.get_owner(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    _pending_state[callback.from_user.id] = "set_tz"
+    await callback.message.answer(
+        "🕐 Введите часовой пояс — число от −12 до +14.\n"
+        "Примеры: Москва = 3, Екатеринбург = 5, Калининград = 2",
+        reply_markup=_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cfg_cancel")
+async def callback_cfg_cancel(callback: CallbackQuery) -> None:
+    _pending_state.pop(callback.from_user.id, None)
+    await callback.message.edit_text("Отменено.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cfg_delete")
+async def callback_cfg_delete(callback: CallbackQuery) -> None:
+    owner = await db.get_owner(callback.from_user.id)
+    if not owner:
+        await callback.answer("Нет доступа")
+        return
+    contacts = await db.get_contacts(owner.chat_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Да, удалить всё", callback_data="confirm_delete"),
+        InlineKeyboardButton(text="Отмена", callback_data="cancel_delete"),
+    ]])
+    await callback.message.answer(
+        f"⚠️ Удалить аккаунт?\n\n"
+        f"Будут удалены ваш профиль и {len(contacts)} подписчиков.\n"
+        "Это действие необратимо.",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Legacy text commands (still work)
+# ---------------------------------------------------------------------------
 
 @router.message(Command("setname"))
 async def cmd_setname(message: Message) -> None:
@@ -206,6 +320,14 @@ async def cmd_settz(message: Message) -> None:
     await message.answer(f"✅ Часовой пояс: UTC{offset:+d}")
 
 
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message) -> None:
+    if _pending_state.pop(message.from_user.id, None):
+        await message.answer("Ввод отменён.", reply_markup=_owner_keyboard())
+    else:
+        await message.answer("Нечего отменять.")
+
+
 @router.message(Command("deleteaccount"))
 async def cmd_deleteaccount(message: Message) -> None:
     owner = await db.get_owner(message.from_user.id)
@@ -233,11 +355,13 @@ async def callback_confirm_delete(callback: CallbackQuery) -> None:
         return
     await db.delete_owner(callback.from_user.id)
     await callback.message.edit_text("✅ Аккаунт и все контакты удалены.")
+    await callback.answer()
 
 
 @router.callback_query(F.data == "cancel_delete")
 async def callback_cancel_delete(callback: CallbackQuery) -> None:
     await callback.message.edit_text("Отменено.")
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +425,7 @@ async def cmd_mylink(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# SOS commands (owner)
+# SOS (owner)
 # ---------------------------------------------------------------------------
 
 @router.message(Command("test"))
@@ -319,6 +443,7 @@ async def cmd_test(message: Message) -> None:
 
 
 @router.message(Command("sos"))
+@router.message(F.text == "🚨 Отправить SOS")
 async def cmd_sos(message: Message) -> None:
     owner = await db.get_owner(message.from_user.id)
     if not owner:
@@ -347,47 +472,15 @@ async def callback_confirm_sos(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "cancel_sos")
 async def callback_cancel_sos(callback: CallbackQuery) -> None:
     await callback.message.edit_text("Отменено.")
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
-# Subscriber commands
+# Replies (owner)
 # ---------------------------------------------------------------------------
-
-@router.message(Command("unsubscribe"))
-async def cmd_unsubscribe(message: Message) -> None:
-    removed = await db.remove_subscriber(message.from_user.id)
-    if removed:
-        await message.answer(
-            f"❌ Вы отписались от {removed} оповещений.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-    else:
-        await message.answer("Вы не были подписаны ни на одного владельца.")
-
-
-@router.message(Command("subscribe"))
-async def cmd_subscribe_hint(message: Message) -> None:
-    await message.answer(
-        "Для подписки используйте персональную ссылку от владельца бота.\n"
-        "Она выглядит так:\n"
-        f"https://t.me/botname?start=sub_..."
-    )
-
-
-@router.message(F.text == "📋 Мои подписки")
-async def cmd_my_subscriptions(message: Message) -> None:
-    owners = await db.get_owners_for_contact(message.from_user.id)
-    if not owners:
-        await message.answer("Вы не подписаны ни на кого.\nДля отписки от всех: /unsubscribe")
-        return
-    lines = ["📋 Ваши подписки:\n"]
-    for i, owner in enumerate(owners, 1):
-        lines.append(f"{i}. {owner.name}")
-    lines.append("\nДля отписки от всех: /unsubscribe")
-    await message.answer("\n".join(lines))
-
 
 @router.message(Command("replies"))
+@router.message(F.text == "📬 Ответы")
 async def cmd_replies(message: Message) -> None:
     try:
         owner = await db.get_owner(message.from_user.id)
@@ -408,18 +501,101 @@ async def cmd_replies(message: Message) -> None:
         await message.answer("Ошибка при получении ответов. Проверьте логи.")
 
 
+# ---------------------------------------------------------------------------
+# Subscriber commands
+# ---------------------------------------------------------------------------
+
+@router.message(Command("unsubscribe"))
+@router.message(F.text == "❌ Отписаться")
+async def cmd_unsubscribe(message: Message) -> None:
+    removed = await db.remove_subscriber(message.from_user.id)
+    if removed:
+        await message.answer(
+            f"❌ Вы отписались от {removed} оповещений.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await message.answer("Вы не были подписаны ни на одного владельца.")
+
+
+@router.message(Command("subscribe"))
+async def cmd_subscribe_hint(message: Message) -> None:
+    await message.answer(
+        "Для подписки используйте персональную ссылку от владельца бота.\n"
+        "Она выглядит так:\n"
+        "https://t.me/botname?start=sub_..."
+    )
+
+
+@router.message(F.text == "📋 Мои подписки")
+async def cmd_my_subscriptions(message: Message) -> None:
+    owners = await db.get_owners_for_contact(message.from_user.id)
+    if not owners:
+        await message.answer("Вы не подписаны ни на кого.")
+        return
+    lines = ["📋 Ваши подписки:\n"]
+    for i, owner in enumerate(owners, 1):
+        lines.append(f"{i}. {owner.name}")
+    await message.answer("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Catch-all: settings input + subscriber reply forwarding
+# ---------------------------------------------------------------------------
+
 @router.message(F.text)
-async def handle_subscriber_reply(message: Message) -> None:
+async def handle_text(message: Message) -> None:
     if not message.text or message.text.startswith("/"):
         return
+
+    chat_id = message.from_user.id
+    state = _pending_state.pop(chat_id, None)
+
+    if state == "set_name":
+        owner = await db.get_owner(chat_id)
+        if not owner:
+            return
+        name = message.text.strip()
+        await db.update_owner(chat_id, name=name)
+        await message.answer(f"✅ Имя изменено на «{name}»", reply_markup=_owner_keyboard())
+        return
+
+    if state == "set_message":
+        owner = await db.get_owner(chat_id)
+        if not owner:
+            return
+        text = message.text.strip()
+        await db.update_owner(chat_id, sos_message=text)
+        await message.answer(f"✅ Текст SOS изменён:\n{text}", reply_markup=_owner_keyboard())
+        return
+
+    if state == "set_tz":
+        owner = await db.get_owner(chat_id)
+        if not owner:
+            return
+        try:
+            offset = int(message.text.strip().lstrip("+"))
+            if not -12 <= offset <= 14:
+                raise ValueError
+            await db.update_owner(chat_id, tz_offset=offset)
+            await message.answer(f"✅ Часовой пояс: UTC{offset:+d}", reply_markup=_owner_keyboard())
+        except ValueError:
+            _pending_state[chat_id] = "set_tz"
+            await message.answer(
+                "Введите число от -12 до +14, например: 3",
+                reply_markup=_cancel_keyboard(),
+            )
+        return
+
+    # Forward as subscriber reply to owner(s)
     try:
-        owners = await db.get_owners_for_contact(message.from_user.id)
+        owners = await db.get_owners_for_contact(chat_id)
         if not owners:
             return
         sender_name = message.from_user.full_name
         text = message.text.strip()
         for owner in owners:
-            await db.add_reply(owner.chat_id, message.from_user.id, sender_name, text)
+            await db.add_reply(owner.chat_id, chat_id, sender_name, text)
             try:
                 await message.bot.send_message(
                     owner.chat_id,
@@ -429,7 +605,7 @@ async def handle_subscriber_reply(message: Message) -> None:
                 logger.exception("Failed to forward reply to owner %d", owner.chat_id)
         await message.answer("✅ Ваш ответ отправлен.")
     except Exception:
-        logger.exception("handle_subscriber_reply error")
+        logger.exception("handle_text error")
         await message.answer("Ошибка при отправке ответа.")
 
 
