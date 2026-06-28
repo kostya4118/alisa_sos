@@ -93,7 +93,11 @@ async def alice_webhook(webhook_token: str, request: Request):
                 "Список контактов пуст. Добавьте контакты через Telegram бота.",
                 end_session=True,
             )
-        replies = await db.get_unread_replies(owner.chat_id)
+        try:
+            replies = await db.get_unread_replies(owner.chat_id)
+        except Exception:
+            logger.exception("get_unread_replies failed for owner %d", owner.chat_id)
+            replies = []
         if replies:
             _sessions[session_id] = {
                 "state": "awaiting_read_replies",

@@ -389,39 +389,48 @@ async def cmd_my_subscriptions(message: Message) -> None:
 
 @router.message(Command("replies"))
 async def cmd_replies(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
-    if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
-        return
-    replies = await db.get_unread_replies(owner.chat_id)
-    if not replies:
-        await message.answer("Нет новых ответов от контактов.")
-        return
-    lines = [f"📬 Новые ответы ({len(replies)}):\n"]
-    for r in replies:
-        lines.append(f"👤 {r['contact_name']}:\n{r['text']}\n")
-    await message.answer("\n".join(lines))
-    await db.mark_replies_read(owner.chat_id)
+    try:
+        owner = await db.get_owner(message.from_user.id)
+        if not owner:
+            await message.answer("Вы не зарегистрированы. Используйте /register")
+            return
+        replies = await db.get_unread_replies(owner.chat_id)
+        if not replies:
+            await message.answer("Нет новых ответов от контактов.")
+            return
+        lines = [f"📬 Новые ответы ({len(replies)}):\n"]
+        for r in replies:
+            lines.append(f"👤 {r['contact_name']}:\n{r['text']}\n")
+        await message.answer("\n".join(lines))
+        await db.mark_replies_read(owner.chat_id)
+    except Exception:
+        logger.exception("cmd_replies error")
+        await message.answer("Ошибка при получении ответов. Проверьте логи.")
 
 
-@router.message(F.text & ~F.text.startswith("/"))
+@router.message(F.text)
 async def handle_subscriber_reply(message: Message) -> None:
-    """Forward any plain text message from a subscriber to their owner(s)."""
-    owners = await db.get_owners_for_contact(message.from_user.id)
-    if not owners:
+    if not message.text or message.text.startswith("/"):
         return
-    sender_name = message.from_user.full_name
-    text = message.text.strip()
-    for owner in owners:
-        await db.add_reply(owner.chat_id, message.from_user.id, sender_name, text)
-        try:
-            await message.bot.send_message(
-                owner.chat_id,
-                f"💬 Ответ от {sender_name}:\n{text}",
-            )
-        except Exception:
-            logger.exception("Failed to forward reply to owner %d", owner.chat_id)
-    await message.answer("✅ Ваш ответ отправлен.")
+    try:
+        owners = await db.get_owners_for_contact(message.from_user.id)
+        if not owners:
+            return
+        sender_name = message.from_user.full_name
+        text = message.text.strip()
+        for owner in owners:
+            await db.add_reply(owner.chat_id, message.from_user.id, sender_name, text)
+            try:
+                await message.bot.send_message(
+                    owner.chat_id,
+                    f"💬 Ответ от {sender_name}:\n{text}",
+                )
+            except Exception:
+                logger.exception("Failed to forward reply to owner %d", owner.chat_id)
+        await message.answer("✅ Ваш ответ отправлен.")
+    except Exception:
+        logger.exception("handle_subscriber_reply error")
+        await message.answer("Ошибка при отправке ответа.")
 
 
 def create_dispatcher() -> Dispatcher:
