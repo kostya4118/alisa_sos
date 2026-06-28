@@ -22,7 +22,7 @@ from config import settings
 logger = logging.getLogger(__name__)
 router = Router()
 
-# chat_id → "set_name" | "set_message" | "set_tz"
+# chat_id → "set_name" | "set_message" | "set_tz" | "set_checkin_time"
 _pending_state: dict[int, str] = {}
 
 
@@ -65,6 +65,58 @@ def _cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="❌ Отмена", callback_data="cfg_cancel"),
     ]])
+
+
+def _approval_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{chat_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{chat_id}"),
+    ]])
+
+
+def _admin_delete_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data=f"admin_delete:{chat_id}"),
+    ]])
+
+
+def _admin_delete_confirm_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"admin_delete_confirm:{chat_id}"),
+        InlineKeyboardButton(text="Отмена", callback_data="admin_cancel"),
+    ]])
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def _get_active_owner(chat_id: int, reply_target: Message) -> db.Owner | None:
+    """Return owner only if registered and approved. Sends error message otherwise."""
+    owner = await db.get_owner(chat_id)
+    if not owner:
+        await reply_target.answer("Вы не зарегистрированы. Используйте /register")
+        return None
+    if owner.status != "active":
+        await reply_target.answer(
+            "⏳ Ваш аккаунт ожидает одобрения администратора.\n"
+            "Вы получите уведомление, как только заявка будет рассмотрена."
+        )
+        return None
+    return owner
+
+
+async def _get_active_owner_cb(callback: CallbackQuery) -> db.Owner | None:
+    """Return owner only if registered and approved. Answers callback with error otherwise."""
+    owner = await db.get_owner(callback.from_user.id)
+    if not owner or owner.status != "active":
+        await callback.answer("Нет доступа")
+        return None
+    return owner
+
+
+def _is_admin(chat_id: int) -> bool:
+    return bool(settings.admin_chat_id and chat_id == settings.admin_chat_id)
 
 
 # ---------------------------------------------------------------------------
@@ -110,11 +162,18 @@ async def cmd_start(message: Message) -> None:
     # Regular /start — check if user is already an owner
     owner = await db.get_owner(message.from_user.id)
     if owner:
-        await message.answer(
-            f"👋 С возвращением, {owner.name}!\n\n"
-            "Управляйте контактами и настройками через кнопки ниже.",
-            reply_markup=_owner_keyboard(),
-        )
+        if owner.status == "pending":
+            await message.answer(
+                f"👋 Привет, {owner.name}!\n\n"
+                "⏳ Ваша заявка на регистрацию отправлена администратору.\n"
+                "Мы уведомим вас, как только она будет рассмотрена."
+            )
+        else:
+            await message.answer(
+                f"👋 С возвращением, {owner.name}!\n\n"
+                "Управляйте контактами и настройками через кнопки ниже.",
+                reply_markup=_owner_keyboard(),
+            )
     else:
         await message.answer(
             f"👋 Привет, {message.from_user.first_name}!\n\n"
@@ -134,29 +193,233 @@ async def cmd_start(message: Message) -> None:
 async def cmd_register(message: Message) -> None:
     existing = await db.get_owner(message.from_user.id)
     if existing:
-        await message.answer(
-            f"Вы уже зарегистрированы как {existing.name}.\n\n"
-            "Используйте кнопку «📊 Статус» чтобы посмотреть все настройки.",
-            reply_markup=_owner_keyboard(),
-        )
+        if existing.status == "pending":
+            await message.answer(
+                "⏳ Ваша заявка уже отправлена и ожидает одобрения администратора.\n"
+                "Вы получите уведомление, как только она будет рассмотрена."
+            )
+        else:
+            await message.answer(
+                f"Вы уже зарегистрированы как {existing.name}.\n\n"
+                "Используйте кнопку «📊 Статус» чтобы посмотреть все настройки.",
+                reply_markup=_owner_keyboard(),
+            )
         return
 
-    owner = await db.create_owner(message.from_user.id, message.from_user.full_name)
-    bot_info = await message.bot.get_me()
+    chat_id = message.from_user.id
+    name = message.from_user.full_name
+
+    # If no admin configured, or registrant IS the admin — approve immediately
+    if not settings.admin_chat_id or chat_id == settings.admin_chat_id:
+        owner = await db.create_owner(chat_id, name, status="active")
+        bot_info = await message.bot.get_me()
+        subscribe_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
+        webhook_url = f"{settings.base_url}/alice/{owner.webhook_token}"
+        await message.answer(
+            f"✅ Вы зарегистрированы!\n\n"
+            f"<b>Webhook URL для Яндекс Диалогов:</b>\n"
+            f"<code>{webhook_url}</code>\n\n"
+            f"<b>Ссылка для друзей:</b>\n"
+            f"{subscribe_link}\n\n"
+            "Скопируйте Webhook URL и вставьте в настройки своего навыка Алисы.\n"
+            "Поделитесь ссылкой с друзьями — они подпишутся одним нажатием.",
+            parse_mode="HTML",
+            reply_markup=_owner_keyboard(),
+        )
+    else:
+        await db.create_owner(chat_id, name, status="pending")
+        await message.answer(
+            "⏳ Заявка на регистрацию отправлена администратору.\n"
+            "Вы получите уведомление, когда она будет рассмотрена."
+        )
+        try:
+            await message.bot.send_message(
+                settings.admin_chat_id,
+                f"📩 <b>Новая заявка на регистрацию</b>\n\n"
+                f"👤 Имя: {name}\n"
+                f"🆔 ID: <code>{chat_id}</code>",
+                parse_mode="HTML",
+                reply_markup=_approval_keyboard(chat_id),
+            )
+        except Exception:
+            logger.exception("Failed to notify admin about registration from %d", chat_id)
+
+
+# ---------------------------------------------------------------------------
+# Approval / rejection (admin only)
+# ---------------------------------------------------------------------------
+
+@router.callback_query(F.data.startswith("approve:"))
+async def callback_approve(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    chat_id = int(callback.data.split(":")[1])
+    owner = await db.get_owner(chat_id)
+    if not owner:
+        await callback.message.edit_text("❌ Пользователь не найден (возможно, удалил аккаунт).")
+        await callback.answer()
+        return
+    await db.set_owner_status(chat_id, "active")
+    bot_info = await callback.message.bot.get_me()
     subscribe_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
     webhook_url = f"{settings.base_url}/alice/{owner.webhook_token}"
+    await callback.message.edit_text(f"✅ Одобрено: {owner.name} (id: {chat_id})")
+    try:
+        await callback.message.bot.send_message(
+            chat_id,
+            f"✅ Ваша регистрация одобрена!\n\n"
+            f"<b>Webhook URL для Яндекс Диалогов:</b>\n"
+            f"<code>{webhook_url}</code>\n\n"
+            f"<b>Ссылка для друзей:</b>\n"
+            f"{subscribe_link}\n\n"
+            "Используйте кнопки ниже для управления ботом.",
+            parse_mode="HTML",
+            reply_markup=_owner_keyboard(),
+        )
+    except Exception:
+        logger.exception("Failed to notify user %d about approval", chat_id)
+    await callback.answer("✅ Одобрено")
+
+
+@router.callback_query(F.data.startswith("reject:"))
+async def callback_reject(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    chat_id = int(callback.data.split(":")[1])
+    owner = await db.get_owner(chat_id)
+    name = owner.name if owner else str(chat_id)
+    await db.delete_owner(chat_id)
+    await callback.message.edit_text(f"❌ Отклонено: {name} (id: {chat_id})")
+    try:
+        await callback.message.bot.send_message(
+            chat_id,
+            "❌ Ваша заявка на регистрацию отклонена администратором.\n"
+            "Если считаете это ошибкой — свяжитесь с администратором."
+        )
+    except Exception:
+        logger.exception("Failed to notify user %d about rejection", chat_id)
+    await callback.answer("❌ Отклонено")
+
+
+# ---------------------------------------------------------------------------
+# Admin panel
+# ---------------------------------------------------------------------------
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    owners = await db.get_all_owners()
+    pending = [o for o in owners if o.status == "pending"]
+    active = [o for o in owners if o.status == "active"]
+
+    kb_rows = []
+    if pending:
+        kb_rows.append([InlineKeyboardButton(
+            text=f"⏳ Заявки ({len(pending)})", callback_data="admin_list_pending"
+        )])
+    kb_rows.append([InlineKeyboardButton(
+        text=f"📋 Все владельцы ({len(active)})", callback_data="admin_list_active"
+    )])
 
     await message.answer(
-        f"✅ Вы зарегистрированы!\n\n"
-        f"<b>Webhook URL для Яндекс Диалогов:</b>\n"
-        f"<code>{webhook_url}</code>\n\n"
-        f"<b>Ссылка для друзей:</b>\n"
-        f"{subscribe_link}\n\n"
-        "Скопируйте Webhook URL и вставьте в настройки своего навыка Алисы.\n"
-        "Поделитесь ссылкой с друзьями — они подпишутся одним нажатием.",
+        f"👑 <b>Панель администратора</b>\n\n"
+        f"✅ Активных владельцев: {len(active)}\n"
+        f"⏳ Ожидают одобрения: {len(pending)}",
         parse_mode="HTML",
-        reply_markup=_owner_keyboard(),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
     )
+
+
+@router.callback_query(F.data == "admin_list_active")
+async def callback_admin_list_active(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    owners = [o for o in await db.get_all_owners() if o.status == "active"]
+    if not owners:
+        await callback.answer("Нет активных владельцев")
+        return
+    await callback.answer()
+    for owner in owners:
+        contacts = await db.get_contacts(owner.chat_id)
+        await callback.message.answer(
+            f"👤 <b>{owner.name}</b>\n"
+            f"🆔 ID: <code>{owner.chat_id}</code>\n"
+            f"👥 Контактов: {len(contacts)}\n"
+            f"🕐 Часовой пояс: UTC{owner.tz_offset:+d}",
+            parse_mode="HTML",
+            reply_markup=_admin_delete_keyboard(owner.chat_id),
+        )
+
+
+@router.callback_query(F.data == "admin_list_pending")
+async def callback_admin_list_pending(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    owners = [o for o in await db.get_all_owners() if o.status == "pending"]
+    if not owners:
+        await callback.answer("Нет заявок")
+        return
+    await callback.answer()
+    for owner in owners:
+        await callback.message.answer(
+            f"📩 <b>{owner.name}</b>\n"
+            f"🆔 ID: <code>{owner.chat_id}</code>",
+            parse_mode="HTML",
+            reply_markup=_approval_keyboard(owner.chat_id),
+        )
+
+
+@router.callback_query(F.data.startswith("admin_delete:"))
+async def callback_admin_delete(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    chat_id = int(callback.data.split(":")[1])
+    owner = await db.get_owner(chat_id)
+    if not owner:
+        await callback.message.edit_text("Пользователь не найден.")
+        await callback.answer()
+        return
+    contacts = await db.get_contacts(owner.chat_id)
+    await callback.message.edit_text(
+        f"⚠️ Удалить аккаунт <b>{owner.name}</b> (id: {chat_id})?\n\n"
+        f"Будут удалены: {len(contacts)} контактов, все ответы и данные авточека.",
+        parse_mode="HTML",
+        reply_markup=_admin_delete_confirm_keyboard(chat_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_delete_confirm:"))
+async def callback_admin_delete_confirm(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    chat_id = int(callback.data.split(":")[1])
+    owner = await db.get_owner(chat_id)
+    name = owner.name if owner else str(chat_id)
+    await db.delete_owner(chat_id)
+    await callback.message.edit_text(f"✅ Аккаунт {name} (id: {chat_id}) удалён вместе со всеми данными.")
+    try:
+        await callback.message.bot.send_message(
+            chat_id,
+            "❌ Ваш аккаунт был удалён администратором.\n"
+            "Для повторной регистрации используйте /register."
+        )
+    except Exception:
+        logger.exception("Failed to notify deleted user %d", chat_id)
+    await callback.answer("✅ Удалено")
+
+
+@router.callback_query(F.data == "admin_cancel")
+async def callback_admin_cancel(callback: CallbackQuery) -> None:
+    await callback.message.edit_text("Отменено.")
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -166,9 +429,8 @@ async def cmd_register(message: Message) -> None:
 @router.message(Command("settings"))
 @router.message(F.text == "📊 Статус")
 async def cmd_status(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
+    owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
         return
     contacts = await db.get_contacts(owner.chat_id)
     bot_info = await message.bot.get_me()
@@ -192,9 +454,8 @@ async def cmd_status(message: Message) -> None:
 
 @router.message(F.text == "⚙️ Настройки")
 async def cmd_settings_menu(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
+    owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
         return
     await message.answer(
         f"⚙️ <b>Редактирование настроек</b>\n\n"
@@ -208,8 +469,7 @@ async def cmd_settings_menu(message: Message) -> None:
 
 @router.callback_query(F.data == "cfg_name")
 async def callback_cfg_name(callback: CallbackQuery) -> None:
-    if not await db.get_owner(callback.from_user.id):
-        await callback.answer("Нет доступа")
+    if not await _get_active_owner_cb(callback):
         return
     _pending_state[callback.from_user.id] = "set_name"
     await callback.message.answer("✏️ Введите новое имя:", reply_markup=_cancel_keyboard())
@@ -218,8 +478,7 @@ async def callback_cfg_name(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "cfg_message")
 async def callback_cfg_message(callback: CallbackQuery) -> None:
-    if not await db.get_owner(callback.from_user.id):
-        await callback.answer("Нет доступа")
+    if not await _get_active_owner_cb(callback):
         return
     _pending_state[callback.from_user.id] = "set_message"
     await callback.message.answer(
@@ -231,8 +490,7 @@ async def callback_cfg_message(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "cfg_tz")
 async def callback_cfg_tz(callback: CallbackQuery) -> None:
-    if not await db.get_owner(callback.from_user.id):
-        await callback.answer("Нет доступа")
+    if not await _get_active_owner_cb(callback):
         return
     _pending_state[callback.from_user.id] = "set_tz"
     await callback.message.answer(
@@ -252,8 +510,7 @@ async def callback_cfg_cancel(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "cfg_checkin")
 async def callback_cfg_checkin(callback: CallbackQuery) -> None:
-    if not await db.get_owner(callback.from_user.id):
-        await callback.answer("Нет доступа")
+    if not await _get_active_owner_cb(callback):
         return
     row = await db.get_checkin(callback.from_user.id)
     if row and row["enabled"]:
@@ -286,8 +543,7 @@ async def callback_cfg_checkin(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.in_({"cfg_checkin_on", "cfg_checkin_time"}))
 async def callback_cfg_checkin_set_time(callback: CallbackQuery) -> None:
-    if not await db.get_owner(callback.from_user.id):
-        await callback.answer("Нет доступа")
+    if not await _get_active_owner_cb(callback):
         return
     _pending_state[callback.from_user.id] = "set_checkin_time"
     await callback.message.answer(
@@ -302,8 +558,7 @@ async def callback_cfg_checkin_set_time(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "cfg_checkin_off")
 async def callback_cfg_checkin_off(callback: CallbackQuery) -> None:
-    if not await db.get_owner(callback.from_user.id):
-        await callback.answer("Нет доступа")
+    if not await _get_active_owner_cb(callback):
         return
     await db.ensure_checkin(callback.from_user.id)
     await db.update_checkin(callback.from_user.id, enabled=0, state="idle", attempts=0)
@@ -323,9 +578,8 @@ async def callback_checkin_ok(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "checkin_sos")
 async def callback_checkin_sos(callback: CallbackQuery) -> None:
-    owner = await db.get_owner(callback.from_user.id)
+    owner = await _get_active_owner_cb(callback)
     if not owner:
-        await callback.answer("Нет доступа")
         return
     await callback.message.edit_text("🆘 Отправляю SOS вашим контактам...")
     sent, failed = await notifier.send_sos(callback.message.bot, owner)
@@ -338,9 +592,8 @@ async def callback_checkin_sos(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "cfg_delete")
 async def callback_cfg_delete(callback: CallbackQuery) -> None:
-    owner = await db.get_owner(callback.from_user.id)
+    owner = await _get_active_owner_cb(callback)
     if not owner:
-        await callback.answer("Нет доступа")
         return
     contacts = await db.get_contacts(owner.chat_id)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
@@ -362,9 +615,8 @@ async def callback_cfg_delete(callback: CallbackQuery) -> None:
 
 @router.message(Command("setname"))
 async def cmd_setname(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
+    owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
         return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -377,9 +629,8 @@ async def cmd_setname(message: Message) -> None:
 
 @router.message(Command("setmessage"))
 async def cmd_setmessage(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
+    owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
         return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -392,9 +643,8 @@ async def cmd_setmessage(message: Message) -> None:
 
 @router.message(Command("settz"))
 async def cmd_settz(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
+    owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
         return
     parts = message.text.split(maxsplit=1)
     try:
@@ -459,9 +709,8 @@ async def callback_cancel_delete(callback: CallbackQuery) -> None:
 @router.message(Command("contacts"))
 @router.message(F.text == "👥 Контакты")
 async def cmd_contacts(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
+    owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
         return
     contacts = await db.get_contacts(owner.chat_id)
     if not contacts:
@@ -485,9 +734,8 @@ async def cmd_contacts(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("remove:"))
 async def callback_remove_contact(callback: CallbackQuery) -> None:
-    owner = await db.get_owner(callback.from_user.id)
+    owner = await _get_active_owner_cb(callback)
     if not owner:
-        await callback.answer("Нет доступа")
         return
     chat_id = int(callback.data.split(":")[1])
     contacts = await db.get_contacts(owner.chat_id)
@@ -500,9 +748,8 @@ async def callback_remove_contact(callback: CallbackQuery) -> None:
 @router.message(Command("mylink"))
 @router.message(F.text == "🔗 Ссылка для друзей")
 async def cmd_mylink(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
+    owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
         return
     bot_info = await message.bot.get_me()
     subscribe_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
@@ -519,9 +766,8 @@ async def cmd_mylink(message: Message) -> None:
 @router.message(Command("test"))
 @router.message(F.text == "🆘 Тест SOS")
 async def cmd_test(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
+    owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
         return
     await message.answer("Отправляю тестовый SOS...")
     sent, failed = await notifier.send_sos(
@@ -533,9 +779,8 @@ async def cmd_test(message: Message) -> None:
 @router.message(Command("sos"))
 @router.message(F.text == "🚨 Отправить SOS")
 async def cmd_sos(message: Message) -> None:
-    owner = await db.get_owner(message.from_user.id)
+    owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
-        await message.answer("Вы не зарегистрированы. Используйте /register")
         return
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🆘 ДА, ОТПРАВИТЬ SOS", callback_data="confirm_sos"),
@@ -546,9 +791,8 @@ async def cmd_sos(message: Message) -> None:
 
 @router.callback_query(F.data == "confirm_sos")
 async def callback_confirm_sos(callback: CallbackQuery) -> None:
-    owner = await db.get_owner(callback.from_user.id)
+    owner = await _get_active_owner_cb(callback)
     if not owner:
-        await callback.answer("Нет доступа")
         return
     await callback.message.edit_text("🆘 Отправляю SOS...")
     sent, failed = await notifier.send_sos(callback.message.bot, owner)
@@ -571,9 +815,8 @@ async def callback_cancel_sos(callback: CallbackQuery) -> None:
 @router.message(F.text == "📬 Ответы")
 async def cmd_replies(message: Message) -> None:
     try:
-        owner = await db.get_owner(message.from_user.id)
+        owner = await _get_active_owner(message.from_user.id, message)
         if not owner:
-            await message.answer("Вы не зарегистрированы. Используйте /register")
             return
         replies = await db.get_unread_replies(owner.chat_id)
         if not replies:
@@ -640,7 +883,7 @@ async def handle_text(message: Message) -> None:
     state = _pending_state.pop(chat_id, None)
 
     if state == "set_name":
-        owner = await db.get_owner(chat_id)
+        owner = await _get_active_owner(chat_id, message)
         if not owner:
             return
         name = message.text.strip()
@@ -649,7 +892,7 @@ async def handle_text(message: Message) -> None:
         return
 
     if state == "set_message":
-        owner = await db.get_owner(chat_id)
+        owner = await _get_active_owner(chat_id, message)
         if not owner:
             return
         text = message.text.strip()
@@ -658,7 +901,7 @@ async def handle_text(message: Message) -> None:
         return
 
     if state == "set_tz":
-        owner = await db.get_owner(chat_id)
+        owner = await _get_active_owner(chat_id, message)
         if not owner:
             return
         try:
@@ -676,7 +919,7 @@ async def handle_text(message: Message) -> None:
         return
 
     if state == "set_checkin_time":
-        owner = await db.get_owner(chat_id)
+        owner = await _get_active_owner(chat_id, message)
         if not owner:
             return
         minutes = checkin_module.parse_time(message.text)

@@ -73,6 +73,11 @@ async def alice_webhook(webhook_token: str, request: Request):
     owner = await db.get_owner_by_token(webhook_token)
     if owner is None:
         raise HTTPException(status_code=404, detail="Unknown webhook token")
+    if owner.status != "active":
+        return _alice_response(
+            "Ваш аккаунт ещё не подтверждён администратором. Попробуйте позже.",
+            end_session=True,
+        )
 
     bot: Bot = request.app.state.bot
     body: dict = await request.json()

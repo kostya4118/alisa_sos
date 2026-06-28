@@ -1,6 +1,6 @@
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import aiosqlite
 
@@ -14,6 +14,7 @@ class Owner:
     sos_message: str
     tz_offset: int
     webhook_token: str
+    status: str = field(default="active")  # "pending" | "active"
 
 
 async def init(path: str) -> None:
@@ -56,6 +57,12 @@ async def init(path: str) -> None:
         );
     """)
     await _conn.commit()
+    # Add status column to existing installations (idempotent)
+    try:
+        await _conn.execute("ALTER TABLE owners ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        await _conn.commit()
+    except aiosqlite.OperationalError:
+        pass  # column already exists
 
 
 async def close() -> None:
@@ -69,12 +76,14 @@ def _conn_or_error() -> aiosqlite.Connection:
 
 
 def _row_to_owner(row) -> Owner:
+    d = dict(row)
     return Owner(
-        chat_id=row["chat_id"],
-        name=row["name"],
-        sos_message=row["sos_message"],
-        tz_offset=row["tz_offset"],
-        webhook_token=row["webhook_token"],
+        chat_id=d["chat_id"],
+        name=d["name"],
+        sos_message=d["sos_message"],
+        tz_offset=d["tz_offset"],
+        webhook_token=d["webhook_token"],
+        status=d.get("status", "active"),
     )
 
 
@@ -94,17 +103,32 @@ async def get_owner_by_token(token: str) -> Owner | None:
     return _row_to_owner(row) if row else None
 
 
-async def create_owner(chat_id: int, name: str) -> Owner:
+async def get_all_owners() -> list[Owner]:
+    """All owners ordered by status (pending first) then name."""
+    async with _conn_or_error().execute(
+        "SELECT * FROM owners ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, name"
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_owner(row) for row in rows]
+
+
+async def create_owner(chat_id: int, name: str, status: str = "active") -> Owner:
     token = str(uuid.uuid4())
     conn = _conn_or_error()
     await conn.execute(
-        "INSERT INTO owners(chat_id, name, webhook_token) VALUES (?, ?, ?)",
-        (chat_id, name, token),
+        "INSERT INTO owners(chat_id, name, webhook_token, status) VALUES (?, ?, ?, ?)",
+        (chat_id, name, token, status),
     )
     await conn.commit()
     return Owner(chat_id=chat_id, name=name,
                  sos_message="🆘 ТРЕВОГА! Мне нужна помощь!",
-                 tz_offset=0, webhook_token=token)
+                 tz_offset=0, webhook_token=token, status=status)
+
+
+async def set_owner_status(chat_id: int, status: str) -> None:
+    conn = _conn_or_error()
+    await conn.execute("UPDATE owners SET status = ? WHERE chat_id = ?", (status, chat_id))
+    await conn.commit()
 
 
 async def update_owner(chat_id: int, **fields) -> None:
@@ -228,7 +252,7 @@ async def get_pending_checkins() -> list[dict]:
         """SELECT c.owner_id, c.enabled, c.time_minutes, c.state, c.attempts,
                   c.last_asked_at, o.tz_offset
            FROM checkins c JOIN owners o ON o.chat_id = c.owner_id
-           WHERE c.enabled = 1"""
+           WHERE c.enabled = 1 AND o.status = 'active'"""
     ) as cur:
         rows = await cur.fetchall()
     return [dict(row) for row in rows]

@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     db_path: str = "sos.db"
+    admin_chat_id: int | None = None
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 
