@@ -56,7 +56,6 @@ async def init(path: str) -> None:
             UNIQUE(owner_id, chat_id, platform)
         );
         CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_id);
-        CREATE INDEX IF NOT EXISTS idx_contacts_chat ON contacts(chat_id, platform);
         CREATE TABLE IF NOT EXISTS checkins (
             owner_id      INTEGER PRIMARY KEY REFERENCES owners(chat_id) ON DELETE CASCADE,
             enabled       INTEGER NOT NULL DEFAULT 0,
@@ -89,6 +88,13 @@ async def init(path: str) -> None:
             await _conn.commit()
         except aiosqlite.OperationalError:
             pass  # column already exists
+
+    # Index on the (now-guaranteed) platform column — created after migrations
+    # so it also works on databases upgraded from the pre-platform schema.
+    await _conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_contacts_chat ON contacts(chat_id, platform)"
+    )
+    await _conn.commit()
 
 
 async def close() -> None:
