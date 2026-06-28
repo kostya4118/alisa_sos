@@ -37,6 +37,14 @@ async def init(path: str) -> None:
             UNIQUE(owner_id, chat_id)
         );
         CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_id);
+        CREATE TABLE IF NOT EXISTS checkins (
+            owner_id      INTEGER PRIMARY KEY REFERENCES owners(chat_id) ON DELETE CASCADE,
+            enabled       INTEGER NOT NULL DEFAULT 0,
+            time_minutes  INTEGER NOT NULL DEFAULT 540,
+            state         TEXT    NOT NULL DEFAULT 'idle',
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            last_asked_at INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS replies (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_id     INTEGER NOT NULL REFERENCES owners(chat_id) ON DELETE CASCADE,
@@ -199,4 +207,48 @@ async def get_unread_replies(owner_id: int) -> list[dict]:
 async def mark_replies_read(owner_id: int) -> None:
     conn = _conn_or_error()
     await conn.execute("UPDATE replies SET read = 1 WHERE owner_id = ? AND read = 0", (owner_id,))
+    await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Checkins (daily check-in / dead-man switch)
+# ---------------------------------------------------------------------------
+
+async def get_checkin(owner_id: int) -> dict | None:
+    async with _conn_or_error().execute(
+        "SELECT * FROM checkins WHERE owner_id = ?", (owner_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def get_pending_checkins() -> list[dict]:
+    """All enabled check-ins joined with owner tz_offset."""
+    async with _conn_or_error().execute(
+        """SELECT c.owner_id, c.enabled, c.time_minutes, c.state, c.attempts,
+                  c.last_asked_at, o.tz_offset
+           FROM checkins c JOIN owners o ON o.chat_id = c.owner_id
+           WHERE c.enabled = 1"""
+    ) as cur:
+        rows = await cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+async def ensure_checkin(owner_id: int) -> None:
+    conn = _conn_or_error()
+    await conn.execute("INSERT OR IGNORE INTO checkins(owner_id) VALUES (?)", (owner_id,))
+    await conn.commit()
+
+
+async def update_checkin(owner_id: int, **fields) -> None:
+    allowed = {"enabled", "time_minutes", "state", "attempts", "last_asked_at"}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return
+    cols = ", ".join(f"{k} = ?" for k in updates)
+    conn = _conn_or_error()
+    await conn.execute(
+        f"UPDATE checkins SET {cols} WHERE owner_id = ?",
+        (*updates.values(), owner_id),
+    )
     await conn.commit()

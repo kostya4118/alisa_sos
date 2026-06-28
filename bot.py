@@ -14,6 +14,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
+import checkin as checkin_module
 import db
 import notifier
 from config import settings
@@ -55,6 +56,7 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="✏️ Изменить имя", callback_data="cfg_name")],
         [InlineKeyboardButton(text="📝 Изменить текст SOS", callback_data="cfg_message")],
         [InlineKeyboardButton(text="🕐 Изменить часовой пояс", callback_data="cfg_tz")],
+        [InlineKeyboardButton(text="⏰ Авточек", callback_data="cfg_checkin")],
         [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data="cfg_delete")],
     ])
 
@@ -245,6 +247,92 @@ async def callback_cfg_tz(callback: CallbackQuery) -> None:
 async def callback_cfg_cancel(callback: CallbackQuery) -> None:
     _pending_state.pop(callback.from_user.id, None)
     await callback.message.edit_text("Отменено.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cfg_checkin")
+async def callback_cfg_checkin(callback: CallbackQuery) -> None:
+    if not await db.get_owner(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    row = await db.get_checkin(callback.from_user.id)
+    if row and row["enabled"]:
+        t = checkin_module.fmt_time(row["time_minutes"])
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏰ Изменить время", callback_data="cfg_checkin_time")],
+            [InlineKeyboardButton(text="🔴 Выключить", callback_data="cfg_checkin_off")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cfg_cancel")],
+        ])
+        await callback.message.answer(
+            f"⏰ Авточек включён: ежедневно в {t}.\n\n"
+            "Бот будет спрашивать «Всё в порядке?» и, если не получит ответа, "
+            "автоматически разошлёт SOS.",
+            reply_markup=kb,
+        )
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Включить", callback_data="cfg_checkin_on")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cfg_cancel")],
+        ])
+        await callback.message.answer(
+            "⏰ Авточек выключен.\n\n"
+            "Если включить — бот будет ежедневно спрашивать «Всё в порядке?».\n"
+            "Нет ответа 1 ч → повтор. Ещё 30 мин → последнее предупреждение. "
+            "Ещё 10 мин → автоматический SOS.",
+            reply_markup=kb,
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({"cfg_checkin_on", "cfg_checkin_time"}))
+async def callback_cfg_checkin_set_time(callback: CallbackQuery) -> None:
+    if not await db.get_owner(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    _pending_state[callback.from_user.id] = "set_checkin_time"
+    await callback.message.answer(
+        "Введите время ежедневной проверки в формате ЧЧ:ММ\n"
+        "Например: <code>09:00</code> или <code>21:30</code>\n\n"
+        "Время указывается в вашем часовом поясе (UTC{tz}).",
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cfg_checkin_off")
+async def callback_cfg_checkin_off(callback: CallbackQuery) -> None:
+    if not await db.get_owner(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    await db.ensure_checkin(callback.from_user.id)
+    await db.update_checkin(callback.from_user.id, enabled=0, state="idle", attempts=0)
+    await callback.message.answer("🔴 Авточек выключен.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "checkin_ok")
+async def callback_checkin_ok(callback: CallbackQuery) -> None:
+    was_active = await checkin_module.confirm(callback.from_user.id)
+    if was_active:
+        await callback.message.edit_text("✅ Отметка принята. Всё хорошо!")
+    else:
+        await callback.message.edit_text("✅ Принято.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "checkin_sos")
+async def callback_checkin_sos(callback: CallbackQuery) -> None:
+    owner = await db.get_owner(callback.from_user.id)
+    if not owner:
+        await callback.answer("Нет доступа")
+        return
+    await callback.message.edit_text("🆘 Отправляю SOS вашим контактам...")
+    sent, failed = await notifier.send_sos(callback.message.bot, owner)
+    await callback.message.answer(
+        f"🆘 SOS отправлен!\n✅ Доставлено: {sent}\n❌ Ошибок: {failed}"
+    )
+    await db.update_checkin(callback.from_user.id, state="idle", attempts=0)
     await callback.answer()
 
 
@@ -586,6 +674,33 @@ async def handle_text(message: Message) -> None:
                 reply_markup=_cancel_keyboard(),
             )
         return
+
+    if state == "set_checkin_time":
+        owner = await db.get_owner(chat_id)
+        if not owner:
+            return
+        minutes = checkin_module.parse_time(message.text)
+        if minutes is None:
+            _pending_state[chat_id] = "set_checkin_time"
+            await message.answer(
+                "Неверный формат. Введите время как <code>09:00</code>:",
+                parse_mode="HTML",
+                reply_markup=_cancel_keyboard(),
+            )
+            return
+        await db.ensure_checkin(chat_id)
+        await db.update_checkin(
+            chat_id, enabled=1, time_minutes=minutes, state="idle", attempts=0, last_asked_at=0
+        )
+        t = checkin_module.fmt_time(minutes)
+        await message.answer(
+            f"✅ Авточек включён. Каждый день в {t} бот будет спрашивать «Всё в порядке?».",
+            reply_markup=_owner_keyboard(),
+        )
+        return
+
+    # Silent checkin confirmation — any text from owner proves they're alive
+    await checkin_module.confirm(chat_id)
 
     # Forward as subscriber reply to owner(s)
     try:

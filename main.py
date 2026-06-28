@@ -8,6 +8,7 @@ from fastapi import FastAPI
 
 import alice
 import bot as bot_module
+import checkin as checkin_module
 import db
 import migrate
 from config import settings
@@ -59,17 +60,19 @@ async def main() -> None:
 
     polling_task = loop.create_task(run_bot(dp, telegram_bot))
     server_task = loop.create_task(run_server(app))
+    checkin_task = loop.create_task(checkin_module.run_loop(telegram_bot))
 
     def _stop(sig, frame):  # noqa: ARG001
         logger.info("Shutting down...")
         polling_task.cancel()
         server_task.cancel()
+        checkin_task.cancel()
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
     try:
-        await asyncio.gather(polling_task, server_task)
+        await asyncio.gather(polling_task, server_task, checkin_task)
     except asyncio.CancelledError:
         pass
     finally:
