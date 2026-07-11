@@ -5,10 +5,17 @@ from dataclasses import dataclass, field
 import aiosqlite
 
 _conn: aiosqlite.Connection | None = None
+_restoring = False  # True while a restore swaps the DB file — blocks all access
 
 # Supported messaging platforms
 TELEGRAM = "telegram"
 MAX = "max"
+
+
+def set_restoring(value: bool) -> None:
+    """Gate all DB access while the database file is being replaced."""
+    global _restoring
+    _restoring = value
 
 
 @dataclass
@@ -110,8 +117,23 @@ async def close() -> None:
 
 
 def _conn_or_error() -> aiosqlite.Connection:
+    if _restoring:
+        raise RuntimeError("База данных восстанавливается, попробуйте позже")
     assert _conn is not None, "DB not initialised — call db.init() first"
     return _conn
+
+
+async def counts() -> dict:
+    """Row counts per table — used to report a restore result."""
+    out: dict[str, int] = {}
+    for t in ("owners", "contacts", "replies", "checkins", "sos_log"):
+        try:
+            async with _conn_or_error().execute(f"SELECT count(*) AS n FROM {t}") as cur:
+                row = await cur.fetchone()
+            out[t] = row["n"] if row else 0
+        except Exception:
+            out[t] = 0
+    return out
 
 
 def _row_to_owner(row) -> Owner:
