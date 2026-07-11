@@ -227,6 +227,17 @@ async def remove_contact(owner_id: int, chat_id: int, platform: str = TELEGRAM) 
     return cur.rowcount > 0
 
 
+async def rename_contact(owner_id: int, chat_id: int, platform: str, new_name: str) -> bool:
+    """Rename one of the owner's contacts. Returns True if it existed."""
+    conn = _conn_or_error()
+    cur = await conn.execute(
+        "UPDATE contacts SET name = ? WHERE owner_id = ? AND chat_id = ? AND platform = ?",
+        (new_name, owner_id, chat_id, platform),
+    )
+    await conn.commit()
+    return cur.rowcount > 0
+
+
 async def remove_subscriber(chat_id: int, platform: str = TELEGRAM) -> int:
     """Remove this (chat_id, platform) from ALL owners' contact lists."""
     conn = _conn_or_error()

@@ -754,12 +754,19 @@ async def cmd_contacts(message: Message) -> None:
     lines = [f"👥 Подписчики ({len(contacts)}):\n"]
     for i, c in enumerate(contacts, 1):
         lines.append(f"{i}. {_tag(c.platform)} {c.name}")
+    lines.append("\n✏️ — переименовать (удобно для Алисы), ❌ — удалить")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"❌ {_tag(c.platform)} {c.name}",
-            callback_data=f"remove:{c.platform}:{c.chat_id}",
-        )]
+        [
+            InlineKeyboardButton(
+                text=f"✏️ {_tag(c.platform)} {c.name}",
+                callback_data=f"rename:{c.platform}:{c.chat_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌",
+                callback_data=f"remove:{c.platform}:{c.chat_id}",
+            ),
+        ]
         for c in contacts
     ])
     await message.answer("\n".join(lines), reply_markup=keyboard)
@@ -777,6 +784,26 @@ async def callback_remove_contact(callback: CallbackQuery) -> None:
     await db.remove_contact(owner.chat_id, chat_id, platform)
     await callback.answer(f"❌ {name} удалён")
     await callback.message.delete()
+
+
+@router.callback_query(F.data.startswith("rename:"))
+async def callback_rename_contact(callback: CallbackQuery) -> None:
+    owner = await _get_active_owner_cb(callback)
+    if not owner:
+        return
+    _, platform, chat_id_str = callback.data.split(":")
+    contacts = await db.get_contacts(owner.chat_id)
+    cur_name = next(
+        (c.name for c in contacts if c.chat_id == int(chat_id_str) and c.platform == platform),
+        chat_id_str,
+    )
+    _pending_state[callback.from_user.id] = f"rename:{platform}:{chat_id_str}"
+    await callback.message.answer(
+        f"✏️ Введите новое имя для «{cur_name}»\n"
+        "(как Алисе удобнее его произносить):",
+        reply_markup=_cancel_keyboard(),
+    )
+    await callback.answer()
 
 
 @router.message(Command("mylink"))
@@ -914,6 +941,23 @@ async def handle_text(message: Message) -> None:
 
     chat_id = message.from_user.id
     state = _pending_state.pop(chat_id, None)
+
+    if state and state.startswith("rename:"):
+        owner = await _get_active_owner(chat_id, message)
+        if not owner:
+            return
+        _, platform, cid_str = state.split(":")
+        new_name = message.text.strip()
+        if not new_name:
+            _pending_state[chat_id] = state
+            await message.answer("Имя не может быть пустым. Введите ещё раз:", reply_markup=_cancel_keyboard())
+            return
+        ok = await db.rename_contact(owner.chat_id, int(cid_str), platform, new_name)
+        if ok:
+            await message.answer(f"✅ Контакт переименован в «{new_name}»", reply_markup=_owner_keyboard())
+        else:
+            await message.answer("Контакт не найден (возможно, удалён).", reply_markup=_owner_keyboard())
+        return
 
     if state == "set_name":
         owner = await _get_active_owner(chat_id, message)

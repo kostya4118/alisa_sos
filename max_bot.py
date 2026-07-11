@@ -315,9 +315,12 @@ async def _menu_action(chat_id: int, payload: str) -> None:
         for i, c in enumerate(contacts, 1):
             tag = "🅼" if c.platform == db.MAX else "📱"
             lines.append(f"{i}. {tag} {c.name}")
-            kb.row(CallbackButton(text=f"❌ {tag} {c.name}",
+            kb.row(CallbackButton(text=f"✏️ {tag} {c.name}",
+                                  payload=f"rename:{c.platform}:{c.chat_id}"),
+                   CallbackButton(text="❌",
                                   payload=f"remove:{c.platform}:{c.chat_id}"))
         kb.row(CallbackButton(text="⬅️ Меню", payload="menu_home"))
+        lines.append("\n✏️ — переименовать (удобно для Алисы), ❌ — удалить")
         await _send(chat_id, "\n".join(lines), kb.as_markup())
 
     elif payload == "menu_test":
@@ -448,6 +451,16 @@ async def _confirm_action(chat_id: int, payload: str) -> None:
         await db.remove_contact(owner.chat_id, cid, platform)
         await _send(chat_id, f"❌ {name} удалён.", _menu_kb())
 
+    elif payload.startswith("rename:"):
+        owner = await _active_owner(chat_id)
+        if not owner:
+            return
+        _, platform, cid_str = payload.split(":")
+        contacts = await db.get_contacts(owner.chat_id)
+        cur = next((c.name for c in contacts if c.chat_id == int(cid_str) and c.platform == platform), cid_str)
+        _pending_state[chat_id] = f"rename:{platform}:{cid_str}"
+        await _send(chat_id, f"✏️ Введите новое имя для «{cur}» (как Алисе удобнее произносить):", _cancel_kb())
+
     elif payload == "checkin_ok":
         await checkin_module.confirm(chat_id)
         await _send(chat_id, "✅ Отметка принята. Всё хорошо!")
@@ -467,6 +480,18 @@ async def _handle_text(chat_id: int, name: str, text: str) -> None:
         return
 
     state = _pending_state.pop(chat_id, None)
+
+    if state and state.startswith("rename:"):
+        owner = await _active_owner(chat_id)
+        if not owner:
+            return
+        _, platform, cid_str = state.split(":")
+        ok = await db.rename_contact(owner.chat_id, int(cid_str), platform, text)
+        if ok:
+            await _send(chat_id, f"✅ Контакт переименован в «{text}»", _menu_kb())
+        else:
+            await _send(chat_id, "Контакт не найден (возможно, удалён).", _menu_kb())
+        return
 
     if state == "set_name":
         if await _active_owner(chat_id):
