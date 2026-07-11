@@ -36,8 +36,10 @@ from maxapi.types.attachments.buttons.callback_button import CallbackButton  # n
 from maxapi.utils.deep_linking import create_start_link, decode_payload      # noqa: E402
 
 _bot: Bot | None = None
-# chat_id → "set_name" | "set_message" | "set_tz" | "set_checkin_time"
+# chat_id → "set_name" | "set_message" | "set_tz" | "set_checkin_time" | "rename:<p>:<id>"
 _pending_state: dict[int, str] = {}
+# subscriber chat_id → reply text awaiting an owner choice (when subscribed to several)
+_pending_reply: dict[int, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -533,19 +535,47 @@ async def _handle_text(chat_id: int, name: str, text: str) -> None:
     # Any text proves the owner is alive — silently confirm an active check-in.
     await checkin_module.confirm(chat_id)
 
-    # Forward as a subscriber reply to owner(s).
+    # Forward as a subscriber reply — to the owner who last sent an SOS.
     owners = await db.get_owners_for_contact(chat_id, db.MAX)
     if not owners:
         return
-    for owner in owners:
-        # Use the name THIS owner gave the contact (may be renamed for Alice).
-        display = await db.get_contact_name(owner.chat_id, chat_id, db.MAX) or name
-        await db.add_reply(owner.chat_id, chat_id, display, text, db.MAX)
-        try:
-            await messaging.send(owner.platform, owner.chat_id, f"💬 Ответ от {display}:\n{text}")
-        except Exception:
-            logger.exception("Failed to forward MAX reply to owner %d", owner.chat_id)
+    target, ask_among = await db.route_reply(chat_id, owners, db.MAX)
+
+    if target is None:
+        _pending_reply[chat_id] = text
+        kb = InlineKeyboardBuilder()
+        for o in ask_among:
+            kb.row(CallbackButton(text=o.name, payload=f"replyto:{o.chat_id}"))
+        await _send(chat_id, "Кому отправить ответ?", kb.as_markup())
+        return
+
+    await _deliver_reply(target, chat_id, text, name)
     await _send(chat_id, "✅ Ваш ответ отправлен.")
+
+
+async def _deliver_reply(owner: db.Owner, contact_chat_id: int, text: str, fallback_name: str) -> None:
+    """Store and forward a subscriber's reply to one owner (MAX side)."""
+    display = await db.get_contact_name(owner.chat_id, contact_chat_id, db.MAX) or fallback_name
+    await db.add_reply(owner.chat_id, contact_chat_id, display, text, db.MAX)
+    try:
+        await messaging.send(owner.platform, owner.chat_id, f"💬 Ответ от {display}:\n{text}")
+    except Exception:
+        logger.exception("Failed to forward MAX reply to owner %d", owner.chat_id)
+
+
+async def _handle_replyto(chat_id: int, name: str, payload: str) -> None:
+    owner_id = int(payload.split(":")[1])
+    text = _pending_reply.pop(chat_id, None)
+    if text is None:
+        await _send(chat_id, "Сообщение устарело — напишите заново.")
+        return
+    owners = await db.get_owners_for_contact(chat_id, db.MAX)
+    target = next((o for o in owners if o.chat_id == owner_id), None)
+    if target is None:
+        await _send(chat_id, "Недоступно.")
+        return
+    await _deliver_reply(target, chat_id, text, name)
+    await _send(chat_id, f"✅ Ответ отправлен: {target.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +638,9 @@ def create_dispatcher() -> Dispatcher:
             await _register(chat_id, _user_name(user))
         elif payload == "noop":
             return
+        elif payload.startswith("replyto:"):
+            user = event.callback.user if event.callback else None
+            await _handle_replyto(chat_id, _user_name(user), payload)
         elif payload.startswith("menu_"):
             await _menu_action(chat_id, payload)
         elif payload.startswith("cfg_"):
