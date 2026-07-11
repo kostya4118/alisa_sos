@@ -228,14 +228,33 @@ async def remove_contact(owner_id: int, chat_id: int, platform: str = TELEGRAM) 
 
 
 async def rename_contact(owner_id: int, chat_id: int, platform: str, new_name: str) -> bool:
-    """Rename one of the owner's contacts. Returns True if it existed."""
+    """Rename one of the owner's contacts. Returns True if it existed.
+
+    Also relabels this contact's already-stored (unread) replies so Alice
+    reads out the new name too.
+    """
     conn = _conn_or_error()
     cur = await conn.execute(
         "UPDATE contacts SET name = ? WHERE owner_id = ? AND chat_id = ? AND platform = ?",
         (new_name, owner_id, chat_id, platform),
     )
+    await conn.execute(
+        "UPDATE replies SET contact_name = ? "
+        "WHERE owner_id = ? AND contact_id = ? AND platform = ?",
+        (new_name, owner_id, chat_id, platform),
+    )
     await conn.commit()
     return cur.rowcount > 0
+
+
+async def get_contact_name(owner_id: int, chat_id: int, platform: str = TELEGRAM) -> str | None:
+    """The name this owner uses for the given contact (may be renamed)."""
+    async with _conn_or_error().execute(
+        "SELECT name FROM contacts WHERE owner_id = ? AND chat_id = ? AND platform = ?",
+        (owner_id, chat_id, platform),
+    ) as cur:
+        row = await cur.fetchone()
+    return row["name"] if row else None
 
 
 async def remove_subscriber(chat_id: int, platform: str = TELEGRAM) -> int:

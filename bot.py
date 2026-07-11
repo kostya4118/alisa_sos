@@ -1027,14 +1027,16 @@ async def handle_text(message: Message) -> None:
         owners = await db.get_owners_for_contact(chat_id, db.TELEGRAM)
         if not owners:
             return
-        sender_name = message.from_user.full_name
+        fallback_name = message.from_user.full_name
         text = message.text.strip()
         for owner in owners:
-            await db.add_reply(owner.chat_id, chat_id, sender_name, text, db.TELEGRAM)
+            # Use the name THIS owner gave the contact (may be renamed for Alice).
+            display = await db.get_contact_name(owner.chat_id, chat_id, db.TELEGRAM) or fallback_name
+            await db.add_reply(owner.chat_id, chat_id, display, text, db.TELEGRAM)
             try:
                 await message.bot.send_message(
                     owner.chat_id,
-                    f"💬 Ответ от {sender_name}:\n{text}",
+                    f"💬 Ответ от {display}:\n{text}",
                 )
             except Exception:
                 logger.exception("Failed to forward reply to owner %d", owner.chat_id)
