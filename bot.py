@@ -14,11 +14,16 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
+import asyncio
+import io
+
+import backup as backup_module
 import checkin as checkin_module
 import db
 import guide
 import messaging
 import notifier
+from aiogram.types import BufferedInputFile
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -29,6 +34,9 @@ _pending_state: dict[int, str] = {}
 
 # subscriber chat_id → reply text awaiting an owner choice (when subscribed to several)
 _pending_reply: dict[int, str] = {}
+
+# admin chat_id → (archive_bytes, filename) awaiting restore confirmation
+_pending_restore: dict[int, tuple[bytes, str]] = {}
 
 
 async def _deliver_reply(tg_bot, owner: db.Owner, contact_chat_id: int,
@@ -463,6 +471,132 @@ async def callback_admin_delete_confirm(callback: CallbackQuery) -> None:
 async def callback_admin_cancel(callback: CallbackQuery) -> None:
     await callback.message.edit_text("Отменено.")
     await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Backup / restore (admin only)
+# ---------------------------------------------------------------------------
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    await message.answer("🗄 Готовлю резервную копию...")
+    try:
+        data, fname = await backup_module.create_archive()
+    except Exception:
+        logger.exception("backup failed")
+        await message.answer("❌ Ошибка при создании бэкапа. Проверьте логи.")
+        return
+    enc = " 🔒 (зашифрован)" if fname.endswith(".enc") else ""
+    await message.answer_document(
+        BufferedInputFile(data, filename=fname),
+        caption=f"🗄 Резервная копия базы{enc}\nРазмер: {max(1, len(data) // 1024)} КБ",
+    )
+
+
+@router.message(Command("restore"))
+async def cmd_restore_hint(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "Чтобы восстановиться из бэкапа — пришлите файл (.tar.gz или .tar.gz.enc) "
+        "как <b>документ</b>, указав в подписи к файлу команду <code>/restore</code>.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(F.document)
+async def handle_document(message: Message) -> None:
+    # Only the admin, only when the caption asks for a restore.
+    if not _is_admin(message.from_user.id):
+        return
+    caption = (message.caption or "").lower()
+    if "/restore" not in caption:
+        return
+    doc = message.document
+    fname = doc.file_name or "backup.tar.gz"
+    if not (fname.endswith(".tar.gz") or fname.endswith(".tar.gz.enc")):
+        await message.answer("Ожидаю файл бэкапа .tar.gz или .tar.gz.enc (из /backup).")
+        return
+    buf = io.BytesIO()
+    try:
+        await message.bot.download(doc, destination=buf)
+    except Exception:
+        logger.exception("failed to download restore file")
+        await message.answer("❌ Не удалось скачать файл. Попробуйте ещё раз.")
+        return
+    _pending_restore[message.from_user.id] = (buf.getvalue(), fname)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить восстановление", callback_data="restore_confirm"),
+        InlineKeyboardButton(text="Отмена", callback_data="restore_cancel"),
+    ]])
+    await message.answer(
+        f"📥 Получен файл: <b>{fname}</b>\n\n"
+        "⚠️ Восстановление <b>заменит</b> текущую базу данных на содержимое архива.\n"
+        "Перед заменой будет создан страховочный бэкап текущего состояния.\n\n"
+        "Продолжить?",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "restore_confirm")
+async def callback_restore_confirm(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа")
+        return
+    pending = _pending_restore.pop(callback.from_user.id, None)
+    if not pending:
+        await callback.answer("Файл не найден — пришлите заново")
+        return
+    data, fname = pending
+    await callback.message.edit_text("🔧 Восстановление... сервис приостановлен.")
+    await callback.answer()
+    try:
+        result = await backup_module.restore_from(data, fname)
+    except Exception as exc:
+        logger.exception("restore failed")
+        await callback.message.answer(f"❌ Ошибка восстановления: {exc}")
+        return
+    c = result["counts"]
+    await callback.message.answer(
+        "✅ <b>Восстановление завершено.</b>\n\n"
+        f"👤 Владельцев: {c.get('owners', 0)}\n"
+        f"👥 Контактов: {c.get('contacts', 0)}\n"
+        f"💬 Ответов: {c.get('replies', 0)}\n"
+        f"⏰ Авточек: {c.get('checkins', 0)}\n\n"
+        f"📦 Файлы: {', '.join(result['files'])}\n"
+        f"🛟 Страховочный бэкап: <code>{result['safety']}</code>",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "restore_cancel")
+async def callback_restore_cancel(callback: CallbackQuery) -> None:
+    _pending_restore.pop(callback.from_user.id, None)
+    await callback.message.edit_text("Отменено.")
+    await callback.answer()
+
+
+async def auto_backup_loop(tg_bot: Bot) -> None:
+    """Send an automatic backup to the admin every BACKUP_INTERVAL_HOURS."""
+    hours = settings.backup_interval_hours
+    if not hours or not settings.admin_chat_id:
+        return
+    while True:
+        await asyncio.sleep(hours * 3600)
+        try:
+            data, fname = await backup_module.create_archive()
+            enc = " 🔒" if fname.endswith(".enc") else ""
+            await tg_bot.send_document(
+                settings.admin_chat_id,
+                BufferedInputFile(data, filename=fname),
+                caption=f"🗄 Авто-бэкап{enc} (каждые {hours} ч)",
+            )
+            logger.info("auto backup sent to admin (%s)", fname)
+        except Exception:
+            logger.exception("auto backup failed")
 
 
 # ---------------------------------------------------------------------------

@@ -83,6 +83,9 @@ async def main() -> None:
     ]
     if max_bot_module is not None:
         tasks.append(loop.create_task(max_bot_module.run_polling()))
+    if settings.backup_interval_hours and settings.admin_chat_id:
+        tasks.append(loop.create_task(bot_module.auto_backup_loop(telegram_bot)))
+        logger.info("Auto-backup enabled: every %d h", settings.backup_interval_hours)
 
     def _stop(sig, frame):  # noqa: ARG001
         logger.info("Shutting down...")
