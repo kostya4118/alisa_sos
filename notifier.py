@@ -46,6 +46,11 @@ async def send_sos(
             failed += 1
             logger.error("Failed SOS to %s (%d/%s): %s",
                          contact.name, contact.chat_id, contact.platform, e)
+        # Remember who alarmed this contact, so their reply routes back here.
+        try:
+            await db.record_sos_recipient(contact.chat_id, contact.platform, owner.chat_id)
+        except Exception:
+            logger.exception("Failed to record SOS recipient %d", contact.chat_id)
 
     try:
         await messaging.send(

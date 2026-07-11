@@ -74,6 +74,13 @@ async def init(path: str) -> None:
             read         INTEGER NOT NULL DEFAULT 0,
             platform     TEXT    NOT NULL DEFAULT 'telegram'
         );
+        CREATE TABLE IF NOT EXISTS sos_log (
+            contact_id INTEGER NOT NULL,
+            platform   TEXT    NOT NULL,
+            owner_id   INTEGER NOT NULL,
+            sent_at    INTEGER NOT NULL,
+            PRIMARY KEY (contact_id, platform, owner_id)
+        );
     """)
     await _conn.commit()
     # Idempotent column additions for installations created before these columns existed.
@@ -315,6 +322,72 @@ async def mark_replies_read(owner_id: int) -> None:
     conn = _conn_or_error()
     await conn.execute("UPDATE replies SET read = 1 WHERE owner_id = ? AND read = 0", (owner_id,))
     await conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Last SOS sender (for routing a subscriber's reply back to the right owner)
+# ---------------------------------------------------------------------------
+
+async def record_sos_recipient(contact_id: int, platform: str, owner_id: int) -> None:
+    """Log that ``owner_id`` just sent an SOS to this contact (one row per owner)."""
+    conn = _conn_or_error()
+    await conn.execute(
+        "INSERT OR REPLACE INTO sos_log(contact_id, platform, owner_id, sent_at) "
+        "VALUES (?, ?, ?, ?)",
+        (contact_id, platform, owner_id, int(time.time())),
+    )
+    await conn.commit()
+
+
+async def get_last_sos_owner(contact_id: int, platform: str = TELEGRAM) -> int | None:
+    """Owner whose SOS reached this contact most recently."""
+    async with _conn_or_error().execute(
+        "SELECT owner_id FROM sos_log WHERE contact_id = ? AND platform = ? "
+        "ORDER BY sent_at DESC LIMIT 1",
+        (contact_id, platform),
+    ) as cur:
+        row = await cur.fetchone()
+    return row["owner_id"] if row else None
+
+
+async def get_recent_sos_owners(contact_id: int, platform: str = TELEGRAM,
+                                within_seconds: int = 3600) -> list[int]:
+    """Distinct owners who sent an SOS to this contact within the window,
+    newest first."""
+    since = int(time.time()) - within_seconds
+    async with _conn_or_error().execute(
+        "SELECT owner_id FROM sos_log WHERE contact_id = ? AND platform = ? AND sent_at >= ? "
+        "ORDER BY sent_at DESC",
+        (contact_id, platform, since),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [r["owner_id"] for r in rows]
+
+
+async def route_reply(contact_id: int, owners: list["Owner"],
+                      platform: str = TELEGRAM) -> tuple["Owner | None", list["Owner"]]:
+    """Decide which owner should receive a subscriber's reply.
+
+    Returns ``(target, ask_among)``. If ``target`` is None the caller should
+    ask the subscriber to choose among ``ask_among`` (buttons). Rules:
+      - one subscription → that owner;
+      - exactly one owner alarmed within the last hour → that owner;
+      - several owners alarmed within the last hour → ask (among them);
+      - none in the last hour → the most recent SOS sender ever, else ask.
+    """
+    if len(owners) <= 1:
+        return (owners[0] if owners else None), owners
+
+    recent_ids = await get_recent_sos_owners(contact_id, platform)
+    recent = [o for o in owners if o.chat_id in recent_ids]
+    if len(recent) == 1:
+        return recent[0], owners
+    if len(recent) > 1:
+        return None, recent
+
+    last_id = await get_last_sos_owner(contact_id, platform)
+    target = next((o for o in owners if o.chat_id == last_id), None)
+    return target, owners
 
 
 # ---------------------------------------------------------------------------

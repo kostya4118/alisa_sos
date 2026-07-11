@@ -24,8 +24,22 @@ from config import settings
 logger = logging.getLogger(__name__)
 router = Router()
 
-# chat_id → "set_name" | "set_message" | "set_tz" | "set_checkin_time"
+# chat_id → "set_name" | "set_message" | "set_tz" | "set_checkin_time" | "rename:<p>:<id>"
 _pending_state: dict[int, str] = {}
+
+# subscriber chat_id → reply text awaiting an owner choice (when subscribed to several)
+_pending_reply: dict[int, str] = {}
+
+
+async def _deliver_reply(tg_bot, owner: db.Owner, contact_chat_id: int,
+                         text: str, fallback_name: str) -> None:
+    """Store and forward a subscriber's reply to one owner (Telegram side)."""
+    display = await db.get_contact_name(owner.chat_id, contact_chat_id, db.TELEGRAM) or fallback_name
+    await db.add_reply(owner.chat_id, contact_chat_id, display, text, db.TELEGRAM)
+    try:
+        await tg_bot.send_message(owner.chat_id, f"💬 Ответ от {display}:\n{text}")
+    except Exception:
+        logger.exception("Failed to forward reply to owner %d", owner.chat_id)
 
 
 async def _subscribe_links_text(tg_bot, owner: db.Owner) -> str:
@@ -1022,28 +1036,47 @@ async def handle_text(message: Message) -> None:
     # Silent checkin confirmation — any text from owner proves they're alive
     await checkin_module.confirm(chat_id)
 
-    # Forward as subscriber reply to owner(s)
+    # Forward as subscriber reply — to the owner who last sent an SOS.
     try:
         owners = await db.get_owners_for_contact(chat_id, db.TELEGRAM)
         if not owners:
             return
-        fallback_name = message.from_user.full_name
         text = message.text.strip()
-        for owner in owners:
-            # Use the name THIS owner gave the contact (may be renamed for Alice).
-            display = await db.get_contact_name(owner.chat_id, chat_id, db.TELEGRAM) or fallback_name
-            await db.add_reply(owner.chat_id, chat_id, display, text, db.TELEGRAM)
-            try:
-                await message.bot.send_message(
-                    owner.chat_id,
-                    f"💬 Ответ от {display}:\n{text}",
-                )
-            except Exception:
-                logger.exception("Failed to forward reply to owner %d", owner.chat_id)
+        target, ask_among = await db.route_reply(chat_id, owners, db.TELEGRAM)
+
+        if target is None:
+            # Ambiguous — ask which owner.
+            _pending_reply[chat_id] = text
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=o.name, callback_data=f"replyto:{o.chat_id}")]
+                for o in ask_among
+            ])
+            await message.answer("Кому отправить ответ?", reply_markup=kb)
+            return
+
+        await _deliver_reply(message.bot, target, chat_id, text, message.from_user.full_name)
         await message.answer("✅ Ваш ответ отправлен.")
     except Exception:
         logger.exception("handle_text error")
         await message.answer("Ошибка при отправке ответа.")
+
+
+@router.callback_query(F.data.startswith("replyto:"))
+async def callback_replyto(callback: CallbackQuery) -> None:
+    chat_id = callback.from_user.id
+    owner_id = int(callback.data.split(":")[1])
+    text = _pending_reply.pop(chat_id, None)
+    if text is None:
+        await callback.answer("Сообщение устарело — напишите заново")
+        return
+    owners = await db.get_owners_for_contact(chat_id, db.TELEGRAM)
+    target = next((o for o in owners if o.chat_id == owner_id), None)
+    if target is None:
+        await callback.answer("Недоступно")
+        return
+    await _deliver_reply(callback.message.bot, target, chat_id, text, callback.from_user.full_name)
+    await callback.message.edit_text(f"✅ Ответ отправлен: {target.name}")
+    await callback.answer()
 
 
 def create_dispatcher() -> Dispatcher:
