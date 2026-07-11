@@ -538,9 +538,11 @@ async def _handle_text(chat_id: int, name: str, text: str) -> None:
     if not owners:
         return
     for owner in owners:
-        await db.add_reply(owner.chat_id, chat_id, name, text, db.MAX)
+        # Use the name THIS owner gave the contact (may be renamed for Alice).
+        display = await db.get_contact_name(owner.chat_id, chat_id, db.MAX) or name
+        await db.add_reply(owner.chat_id, chat_id, display, text, db.MAX)
         try:
-            await messaging.send(owner.platform, owner.chat_id, f"💬 Ответ от {name}:\n{text}")
+            await messaging.send(owner.platform, owner.chat_id, f"💬 Ответ от {display}:\n{text}")
         except Exception:
             logger.exception("Failed to forward MAX reply to owner %d", owner.chat_id)
     await _send(chat_id, "✅ Ваш ответ отправлен.")
