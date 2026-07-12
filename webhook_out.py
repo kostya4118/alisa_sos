@@ -8,6 +8,7 @@ or breaks SOS delivery.
 """
 
 import ipaddress
+import json
 import logging
 from urllib.parse import urlparse
 
@@ -16,6 +17,28 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 8.0
+
+
+def _adapt_payload(url: str, payload: dict) -> dict:
+    """Shape the payload for known providers.
+
+    Pushcut's notification endpoint reads ``title``/``text``/``input`` — so for
+    api.pushcut.io we build those (and pass the full data as JSON ``input`` for
+    the Shortcut to parse). Any other host receives the raw payload unchanged.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+    if host == "api.pushcut.io":
+        who = payload.get("target") or payload.get("owner") or "SOS"
+        return {
+            "title": f"🆘 SOS: {who}",
+            "text": payload.get("message") or "Нужна помощь!",
+            "input": json.dumps(payload, ensure_ascii=False),
+            "isTimeSensitive": True,
+        }
+    return payload
 
 
 def is_allowed_url(url: str) -> bool:
@@ -44,9 +67,10 @@ async def fire(url: str, payload: dict) -> None:
     if not is_allowed_url(url):
         logger.warning("SOS webhook URL rejected: %r", url)
         return
+    body = _adapt_payload(url, payload)
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False) as client:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=body)
         logger.info("SOS webhook %s → %s", url, resp.status_code)
     except Exception:
         logger.exception("SOS webhook failed for %s", url)

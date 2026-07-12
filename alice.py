@@ -57,18 +57,17 @@ def _contact_first_names(contacts: list[db.Contact]) -> str:
 
 
 def _sos_prompt(count: int, has_webhook: bool, prefix: str = "") -> tuple[str, list[str]]:
-    """Recipient question text + buttons; adds the 'через телефон' option
-    when the owner has an outbound webhook configured."""
+    """Recipient question text + buttons; adds the 'Телефон' option when the
+    owner has an outbound webhook configured."""
     if count > 1:
-        text = f"{prefix}Отправить SOS всем {count} контактам или одному"
-        buttons = ["Всем", "Одному"]
-    else:
-        text = f"{prefix}Отправить SOS"
-        buttons = ["Да"]
+        if has_webhook:
+            return (f"{prefix}Отправить SOS всем {count} контактам, одному или на телефон?",
+                    ["Всем", "Одному", "Телефон"])
+        return (f"{prefix}Отправить SOS всем {count} контактам или одному?",
+                ["Всем", "Одному"])
     if has_webhook:
-        text += ", или через телефон"
-        buttons.append("Через телефон")
-    return text + "?", buttons
+        return f"{prefix}Отправить SOS или на телефон?", ["Да", "Телефон"]
+    return f"{prefix}Отправить SOS?", ["Да"]
 
 
 def _alice_response(text: str, *, end_session: bool = False, buttons: list[str] | None = None) -> dict:
@@ -429,7 +428,7 @@ async def alice_webhook(webhook_token: str, request: Request):
                     owner.chat_id, target, fired, extra)
         if fired:
             return _alice_response(
-                f"Отправляю через телефон контакту {target}. Держитесь!",
+                f"Отправляю на телефон контакту {target}. Держитесь!",
                 end_session=True,
             )
         return _alice_response(
