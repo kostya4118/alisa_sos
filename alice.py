@@ -25,6 +25,8 @@ _DONE_WORDS = {"всё", "все", "готово", "достаточно", "хв
 _ALL_WORDS = {"всем", "всё", "все", "всем контактам"}
 _SPECIFIC_WORDS = {"конкретному", "одному", "выбрать", "определённому"}
 _SKIP_WORDS = {"пропустить", "пропусти", "дальше", "пропускаю", "skip"}
+_PHONE_WORDS = {"телефон", "через телефон", "по телефону", "звонок", "позвони", "позвонить", "приложение"}
+_NOMSG_WORDS = {"без сообщения", "не надо сообщения", "без текста", "пусто"}
 
 _sessions: dict[str, dict] = {}
 
@@ -52,6 +54,21 @@ def _find_contact(query: str, contacts: list[db.Contact]) -> db.Contact | None:
 
 def _contact_first_names(contacts: list[db.Contact]) -> str:
     return ", ".join(c.first_name() for c in contacts)
+
+
+def _sos_prompt(count: int, has_webhook: bool, prefix: str = "") -> tuple[str, list[str]]:
+    """Recipient question text + buttons; adds the 'через телефон' option
+    when the owner has an outbound webhook configured."""
+    if count > 1:
+        text = f"{prefix}Отправить SOS всем {count} контактам или одному"
+        buttons = ["Всем", "Одному"]
+    else:
+        text = f"{prefix}Отправить SOS"
+        buttons = ["Да"]
+    if has_webhook:
+        text += ", или через телефон"
+        buttons.append("Через телефон")
+    return text + "?", buttons
 
 
 def _alice_response(text: str, *, end_session: bool = False, buttons: list[str] | None = None) -> dict:
@@ -107,12 +124,9 @@ async def alice_webhook(webhook_token: str, request: Request):
                 buttons=["Да", "Нет"],
             )
         cnt = len(await db.get_contacts(owner.chat_id))
-        sos_btns = ["Всем", "Одному"] if cnt > 1 else ["Да"]
         _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-        return _alice_response(
-            f"{prefix}Отправить SOS всем {cnt} контактам или одному?",
-            buttons=sos_btns,
-        )
+        text, sos_btns = _sos_prompt(cnt, bool(owner.sos_webhook_url), prefix)
+        return _alice_response(text, buttons=sos_btns)
 
     if is_new_session:
         contacts = await db.get_contacts(owner.chat_id)
@@ -139,12 +153,9 @@ async def alice_webhook(webhook_token: str, request: Request):
             )
         count = len(contacts)
         _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-        buttons = ["Всем", "Одному"] if count > 1 else ["Да"]
-        return _alice_response(
-            f"Навык экстренного оповещения. "
-            f"Отправить SOS всем {count} контактам или одному?",
-            buttons=buttons,
-        )
+        text, buttons = _sos_prompt(count, bool(owner.sos_webhook_url),
+                                    "Навык экстренного оповещения. ")
+        return _alice_response(text, buttons=buttons)
 
     state_data = _sessions.get(session_id, {"state": "awaiting_recipient", "owner_id": owner.chat_id})
     state = state_data["state"]
@@ -249,6 +260,28 @@ async def alice_webhook(webhook_token: str, request: Request):
         if _has(_CANCEL_WORDS):
             _sessions.pop(session_id, None)
             return _alice_response("Отменено. Будьте в безопасности.", end_session=True)
+
+        # "Через телефон" — trigger the outbound webhook for a chosen contact.
+        if owner.sos_webhook_url and _has(_PHONE_WORDS):
+            contacts = await db.get_contacts(owner.chat_id)
+            if not contacts:
+                _sessions.pop(session_id, None)
+                return _alice_response("Список контактов пуст.", end_session=True)
+            if len(contacts) == 1:
+                c = contacts[0]
+                _sessions[session_id] = {
+                    "state": "awaiting_webhook_message",
+                    "owner_id": owner.chat_id,
+                    "target_name": c.name,
+                }
+                return _alice_response(
+                    f"Что передать {c.first_name()}? Скажите сообщение или 'без сообщения'.",
+                    buttons=["Без сообщения"],
+                )
+            _sessions[session_id] = {"state": "awaiting_webhook_name", "owner_id": owner.chat_id}
+            return _alice_response(
+                f"Кому позвонить? Назовите имя. Доступные: {_contact_first_names(contacts)}.",
+            )
 
         if _has(_ALL_WORDS) or _has(_CONFIRM_WORDS):
             _sessions[session_id] = {"state": "awaiting_message", "owner_id": owner.chat_id, "recipient": None}
@@ -361,6 +394,48 @@ async def alice_webhook(webhook_token: str, request: Request):
 
         logger.info("Alice SOS owner=%d sent=%d failed=%d extra=%r", owner.chat_id, sent, failed, extra)
         return _alice_response(reply, end_session=True)
+
+    if state == "awaiting_webhook_name":
+        if _has(_CANCEL_WORDS):
+            _sessions.pop(session_id, None)
+            return _alice_response("Отменено.", end_session=True)
+        contacts = await db.get_contacts(owner.chat_id)
+        match = _find_contact(utterance or command, contacts)
+        if match:
+            _sessions[session_id] = {
+                "state": "awaiting_webhook_message",
+                "owner_id": owner.chat_id,
+                "target_name": match.name,
+            }
+            return _alice_response(
+                f"Что передать {match.first_name()}? Скажите сообщение или 'без сообщения'.",
+                buttons=["Без сообщения"],
+            )
+        return _alice_response(
+            f"Не нашла такой контакт. Назовите имя. Доступные: {_contact_first_names(contacts)}.",
+        )
+
+    if state == "awaiting_webhook_message":
+        if _has(_CANCEL_WORDS):
+            _sessions.pop(session_id, None)
+            return _alice_response("Отменено.", end_session=True)
+        target = state_data.get("target_name")
+        extra = ""
+        if not _has(_DONE_WORDS) and not _has(_NOMSG_WORDS):
+            extra = utterance or command
+        fired = await notifier.fire_sos_webhook(owner, extra_message=extra, target=target, kind="sos")
+        _sessions.pop(session_id, None)
+        logger.info("Alice phone-webhook owner=%d target=%r fired=%s extra=%r",
+                    owner.chat_id, target, fired, extra)
+        if fired:
+            return _alice_response(
+                f"Отправляю через телефон контакту {target}. Держитесь!",
+                end_session=True,
+            )
+        return _alice_response(
+            "Не удалось: webhook не настроен. Задайте его в боте в настройках.",
+            end_session=True,
+        )
 
     _sessions.pop(session_id, None)
     return _alice_response("Что-то пошло не так. Попробуйте снова.", end_session=True)

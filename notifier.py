@@ -9,6 +9,45 @@ import webhook_out
 logger = logging.getLogger(__name__)
 
 
+async def fire_sos_webhook(
+    owner: db.Owner,
+    *,
+    extra_message: str = "",
+    target: str | None = None,
+    recipients: int = 0,
+    failed: int = 0,
+    kind: str = "sos",
+) -> bool:
+    """Fire the owner's outbound SOS webhook (fire-and-forget).
+
+    ``target`` is the chosen contact's name (for the "через телефон" flow) so
+    the receiving automation can call/SMS that specific person; None for a
+    normal broadcast SOS.
+
+    Returns True if a request was scheduled (i.e. the owner has a webhook).
+    Never blocks: uses a background task so Alice/Telegram stay responsive.
+    """
+    if not owner.sos_webhook_url:
+        return False
+    tz = timezone(timedelta(hours=owner.tz_offset))
+    payload = {
+        "event": kind,
+        "owner": owner.name,
+        "owner_id": owner.chat_id,
+        "time": datetime.now(tz).isoformat(),
+        "message": extra_message,
+        "target": target,
+        "recipients": recipients,
+        "failed": failed,
+    }
+    try:
+        asyncio.create_task(webhook_out.fire(owner.sos_webhook_url, payload))
+    except RuntimeError:
+        # No running loop (shouldn't happen in the bot) — send inline.
+        await webhook_out.fire(owner.sos_webhook_url, payload)
+    return True
+
+
 async def send_sos(
     owner: db.Owner,
     extra_message: str = "",
@@ -58,21 +97,8 @@ async def send_sos(
             logger.exception("Failed to record SOS recipient %d", contact.chat_id)
 
     # Fire the owner's outbound webhook (fire-and-forget — never blocks SOS).
-    if owner.sos_webhook_url:
-        payload = {
-            "event": kind,
-            "owner": owner.name,
-            "owner_id": owner.chat_id,
-            "time": now.isoformat(),
-            "message": extra_message,
-            "recipients": sent,
-            "failed": failed,
-        }
-        try:
-            asyncio.create_task(webhook_out.fire(owner.sos_webhook_url, payload))
-        except RuntimeError:
-            # No running loop (shouldn't happen in the bot) — send inline.
-            await webhook_out.fire(owner.sos_webhook_url, payload)
+    await fire_sos_webhook(owner, extra_message=extra_message,
+                           recipients=sent, failed=failed, kind=kind)
 
     try:
         await messaging.send(
