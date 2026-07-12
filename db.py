@@ -27,6 +27,7 @@ class Owner:
     webhook_token: str
     status: str = field(default="active")      # "pending" | "active"
     platform: str = field(default=TELEGRAM)    # "telegram" | "max"
+    sos_webhook_url: str = field(default="")   # optional outbound webhook on SOS
 
 
 @dataclass
@@ -52,7 +53,8 @@ async def init(path: str) -> None:
             tz_offset     INTEGER NOT NULL DEFAULT 0,
             webhook_token TEXT    NOT NULL UNIQUE,
             status        TEXT    NOT NULL DEFAULT 'active',
-            platform      TEXT    NOT NULL DEFAULT 'telegram'
+            platform      TEXT    NOT NULL DEFAULT 'telegram',
+            sos_webhook_url TEXT  NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS contacts (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +98,7 @@ async def init(path: str) -> None:
         ("owners", "platform", "ALTER TABLE owners ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
         ("contacts", "platform", "ALTER TABLE contacts ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
         ("replies", "platform", "ALTER TABLE replies ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
+        ("owners", "sos_webhook_url", "ALTER TABLE owners ADD COLUMN sos_webhook_url TEXT NOT NULL DEFAULT ''"),
     ):
         try:
             await _conn.execute(ddl)
@@ -146,6 +149,7 @@ def _row_to_owner(row) -> Owner:
         webhook_token=d["webhook_token"],
         status=d.get("status", "active"),
         platform=d.get("platform", TELEGRAM),
+        sos_webhook_url=d.get("sos_webhook_url", "") or "",
     )
 
 
@@ -200,7 +204,7 @@ async def set_owner_status(chat_id: int, status: str) -> None:
 
 
 async def update_owner(chat_id: int, **fields) -> None:
-    allowed = {"name", "sos_message", "tz_offset"}
+    allowed = {"name", "sos_message", "tz_offset", "sos_webhook_url"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return

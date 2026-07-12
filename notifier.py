@@ -1,8 +1,10 @@
+import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 
 import db
 import messaging
+import webhook_out
 
 logger = logging.getLogger(__name__)
 
@@ -11,11 +13,13 @@ async def send_sos(
     owner: db.Owner,
     extra_message: str = "",
     contacts: list[db.Contact] | None = None,
+    kind: str = "sos",
 ) -> tuple[int, int]:
     """
     Sends SOS on behalf of owner to their contacts.
     Each contact is messaged on its own platform (Telegram or MAX).
     If ``contacts`` is None, sends to all owner's contacts.
+    ``kind`` labels the outbound webhook payload ("sos" | "test" | "auto").
     Returns (sent_count, failed_count).
     """
     targets = contacts if contacts is not None else await db.get_contacts(owner.chat_id)
@@ -25,7 +29,8 @@ async def send_sos(
         return 0, 0
 
     tz = timezone(timedelta(hours=owner.tz_offset))
-    timestamp = datetime.now(tz).strftime("%d.%m.%Y %H:%M:%S")
+    now = datetime.now(tz)
+    timestamp = now.strftime("%d.%m.%Y %H:%M:%S")
     text = (
         f"{owner.sos_message}\n\n"
         f"👤 От: {owner.name}\n"
@@ -51,6 +56,23 @@ async def send_sos(
             await db.record_sos_recipient(contact.chat_id, contact.platform, owner.chat_id)
         except Exception:
             logger.exception("Failed to record SOS recipient %d", contact.chat_id)
+
+    # Fire the owner's outbound webhook (fire-and-forget — never blocks SOS).
+    if owner.sos_webhook_url:
+        payload = {
+            "event": kind,
+            "owner": owner.name,
+            "owner_id": owner.chat_id,
+            "time": now.isoformat(),
+            "message": extra_message,
+            "recipients": sent,
+            "failed": failed,
+        }
+        try:
+            asyncio.create_task(webhook_out.fire(owner.sos_webhook_url, payload))
+        except RuntimeError:
+            # No running loop (shouldn't happen in the bot) — send inline.
+            await webhook_out.fire(owner.sos_webhook_url, payload)
 
     try:
         await messaging.send(

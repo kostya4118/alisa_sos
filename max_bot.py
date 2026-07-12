@@ -21,6 +21,7 @@ import db
 import guide
 import messaging
 import notifier
+import webhook_out
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,7 @@ def _settings_kb():
     kb.row(CallbackButton(text="📝 Изменить текст SOS", payload="cfg_message"))
     kb.row(CallbackButton(text="🕐 Изменить часовой пояс", payload="cfg_tz"))
     kb.row(CallbackButton(text="⏰ Авточек", payload="cfg_checkin"))
+    kb.row(CallbackButton(text="🔗 Webhook при SOS", payload="cfg_webhook"))
     kb.row(CallbackButton(text="🗑 Удалить аккаунт", payload="cfg_delete"))
     kb.row(CallbackButton(text="⬅️ Меню", payload="menu_home"))
     return kb.as_markup()
@@ -327,7 +329,7 @@ async def _menu_action(chat_id: int, payload: str) -> None:
 
     elif payload == "menu_test":
         await _send(chat_id, "Отправляю тестовый SOS...")
-        sent, failed = await notifier.send_sos(owner, extra_message="[ТЕСТ — не паникуйте!]")
+        sent, failed = await notifier.send_sos(owner, extra_message="[ТЕСТ — не паникуйте!]", kind="test")
         await _send(chat_id, f"✅ Тест завершён: {sent} доставлено, {failed} ошибок", _menu_kb())
 
     elif payload == "menu_sos":
@@ -392,6 +394,18 @@ async def _settings_action(chat_id: int, payload: str) -> None:
     elif payload == "cfg_tz":
         _pending_state[chat_id] = "set_tz"
         await _send(chat_id, "🕐 Введите часовой пояс — число от −12 до +14 (Москва = 3):", _cancel_kb())
+    elif payload == "cfg_webhook":
+        _pending_state[chat_id] = "set_webhook"
+        cur = owner.sos_webhook_url or "не задан"
+        await _send(
+            chat_id,
+            "🔗 Webhook при SOS.\n\n"
+            "При каждом SOS бот отправит POST с JSON на этот адрес (Pushcut, IFTTT, "
+            "n8n, свой скрипт).\n\n"
+            f"Сейчас: {cur}\n\n"
+            "Пришлите URL (https://...) или «-», чтобы отключить.",
+            _cancel_kb(),
+        )
     elif payload == "cfg_cancel":
         _pending_state.pop(chat_id, None)
         await _send(chat_id, "Отменено.", _menu_kb())
@@ -493,6 +507,21 @@ async def _handle_text(chat_id: int, name: str, text: str) -> None:
             await _send(chat_id, f"✅ Контакт переименован в «{text}»", _menu_kb())
         else:
             await _send(chat_id, "Контакт не найден (возможно, удалён).", _menu_kb())
+        return
+
+    if state == "set_webhook":
+        if not await _active_owner(chat_id):
+            return
+        if text in ("-", "—", "нет", "off", "выкл"):
+            await db.update_owner(chat_id, sos_webhook_url="")
+            await _send(chat_id, "🔗 Webhook при SOS отключён.", _menu_kb())
+            return
+        if not webhook_out.is_allowed_url(text):
+            _pending_state[chat_id] = "set_webhook"
+            await _send(chat_id, "Некорректный URL. Нужен публичный https-адрес. Пришлите ещё раз или «-».", _cancel_kb())
+            return
+        await db.update_owner(chat_id, sos_webhook_url=text)
+        await _send(chat_id, f"✅ Webhook при SOS сохранён:\n{text}", _menu_kb())
         return
 
     if state == "set_name":

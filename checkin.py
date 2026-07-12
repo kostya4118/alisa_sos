@@ -141,6 +141,7 @@ async def _auto_sos(owner_id: int, now: int) -> None:
         sent, failed = await notifier.send_sos(
             owner,
             extra_message="[АВТО-SOS: владелец не ответил на ежедневную проверку]",
+            kind="auto",
         )
         logger.info("checkin: auto-SOS owner=%d sent=%d failed=%d", owner_id, sent, failed)
     except Exception:

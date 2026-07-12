@@ -23,6 +23,7 @@ import db
 import guide
 import messaging
 import notifier
+import webhook_out
 from aiogram.types import BufferedInputFile
 from config import settings
 
@@ -97,6 +98,7 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📝 Изменить текст SOS", callback_data="cfg_message")],
         [InlineKeyboardButton(text="🕐 Изменить часовой пояс", callback_data="cfg_tz")],
         [InlineKeyboardButton(text="⏰ Авточек", callback_data="cfg_checkin")],
+        [InlineKeyboardButton(text="🔗 Webhook при SOS", callback_data="cfg_webhook")],
         [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data="cfg_delete")],
     ])
 
@@ -633,10 +635,12 @@ async def cmd_settings_menu(message: Message) -> None:
     owner = await _get_active_owner(message.from_user.id, message)
     if not owner:
         return
+    hook = owner.sos_webhook_url or "не задан"
     await message.answer(
         f"⚙️ <b>Редактирование настроек</b>\n\n"
         f"👤 Имя: {owner.name}\n"
         f"🕐 Часовой пояс: UTC{owner.tz_offset:+d}\n"
+        f"🔗 Webhook при SOS: {hook}\n"
         f"📢 Текст SOS:\n{owner.sos_message}",
         parse_mode="HTML",
         reply_markup=_settings_keyboard(),
@@ -672,6 +676,25 @@ async def callback_cfg_tz(callback: CallbackQuery) -> None:
     await callback.message.answer(
         "🕐 Введите часовой пояс — число от −12 до +14.\n"
         "Примеры: Москва = 3, Екатеринбург = 5, Калининград = 2",
+        reply_markup=_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cfg_webhook")
+async def callback_cfg_webhook(callback: CallbackQuery) -> None:
+    owner = await _get_active_owner_cb(callback)
+    if not owner:
+        return
+    _pending_state[callback.from_user.id] = "set_webhook"
+    cur = owner.sos_webhook_url or "не задан"
+    await callback.message.answer(
+        "🔗 <b>Webhook при SOS</b>\n\n"
+        "При каждом SOS бот отправит POST с JSON на этот адрес — можно подключить "
+        "Pushcut (звонок/SMS с iPhone), IFTTT, n8n, умный дом или свой скрипт.\n\n"
+        f"Сейчас: <code>{cur}</code>\n\n"
+        "Пришлите URL (https://...) или «-», чтобы отключить.",
+        parse_mode="HTML",
         reply_markup=_cancel_keyboard(),
     )
     await callback.answer()
@@ -979,7 +1002,7 @@ async def cmd_test(message: Message) -> None:
         return
     await message.answer("Отправляю тестовый SOS...")
     sent, failed = await notifier.send_sos(
-        owner, extra_message="[ТЕСТ — не паникуйте!]"
+        owner, extra_message="[ТЕСТ — не паникуйте!]", kind="test"
     )
     await message.answer(f"✅ Тест завершён: {sent} доставлено, {failed} ошибок")
 
@@ -1123,6 +1146,31 @@ async def handle_text(message: Message) -> None:
         text = message.text.strip()
         await db.update_owner(chat_id, sos_message=text)
         await message.answer(f"✅ Текст SOS изменён:\n{text}", reply_markup=_owner_keyboard())
+        return
+
+    if state == "set_webhook":
+        owner = await _get_active_owner(chat_id, message)
+        if not owner:
+            return
+        val = message.text.strip()
+        if val in ("-", "—", "нет", "off", "выкл"):
+            await db.update_owner(chat_id, sos_webhook_url="")
+            await message.answer("🔗 Webhook при SOS отключён.", reply_markup=_owner_keyboard())
+            return
+        if not webhook_out.is_allowed_url(val):
+            _pending_state[chat_id] = "set_webhook"
+            await message.answer(
+                "Некорректный или недопустимый URL. Нужен публичный https-адрес.\n"
+                "Пришлите ещё раз или «-» для отключения.",
+                reply_markup=_cancel_keyboard(),
+            )
+            return
+        await db.update_owner(chat_id, sos_webhook_url=val)
+        await message.answer(
+            f"✅ Webhook при SOS сохранён:\n{val}\n\n"
+            "Проверьте кнопкой «🆘 Тест SOS» — на адрес придёт POST с event=test.",
+            reply_markup=_owner_keyboard(),
+        )
         return
 
     if state == "set_tz":
