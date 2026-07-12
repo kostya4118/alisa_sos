@@ -278,6 +278,7 @@ async def alice_webhook(webhook_token: str, request: Request):
                     "state": "awaiting_webhook_message",
                     "owner_id": owner.chat_id,
                     "target_name": c.name,
+                    "target_phone": c.phone,
                 }
                 return _alice_response(
                     f"Что передать {c.first_name()}? Скажите сообщение или 'без сообщения'.",
@@ -411,6 +412,7 @@ async def alice_webhook(webhook_token: str, request: Request):
                 "state": "awaiting_webhook_message",
                 "owner_id": owner.chat_id,
                 "target_name": match.name,
+                "target_phone": match.phone,
             }
             return _alice_response(
                 f"Что передать {match.first_name()}? Скажите сообщение или 'без сообщения'.",
@@ -425,10 +427,12 @@ async def alice_webhook(webhook_token: str, request: Request):
             _sessions.pop(session_id, None)
             return _alice_response("Отменено.", end_session=True)
         target = state_data.get("target_name")
+        target_phone = state_data.get("target_phone", "")
         extra = ""
         if not _has(_DONE_WORDS) and not _has(_NOMSG_WORDS):
             extra = utterance or command
-        fired = await notifier.notify_integrations(owner, extra_message=extra, target=target, kind="sos")
+        fired = await notifier.notify_integrations(
+            owner, extra_message=extra, target=target, target_phone=target_phone, kind="sos")
         _sessions.pop(session_id, None)
         logger.info("Alice phone-bridge owner=%d target=%r fired=%s extra=%r",
                     owner.chat_id, target, fired, extra)

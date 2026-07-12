@@ -319,13 +319,16 @@ async def _menu_action(chat_id: int, payload: str) -> None:
         kb = InlineKeyboardBuilder()
         for i, c in enumerate(contacts, 1):
             tag = "🅼" if c.platform == db.MAX else "📱"
-            lines.append(f"{i}. {tag} {c.name}")
-            kb.row(CallbackButton(text=f"✏️ {tag} {c.name}",
+            ph = f" 📞 {c.phone}" if c.phone else ""
+            lines.append(f"{i}. {tag} {c.name}{ph}")
+            kb.row(CallbackButton(text=f"✏️ {c.name}",
                                   payload=f"rename:{c.platform}:{c.chat_id}"),
+                   CallbackButton(text="📞",
+                                  payload=f"phone:{c.platform}:{c.chat_id}"),
                    CallbackButton(text="❌",
                                   payload=f"remove:{c.platform}:{c.chat_id}"))
         kb.row(CallbackButton(text="⬅️ Меню", payload="menu_home"))
-        lines.append("\n✏️ — переименовать (удобно для Алисы), ❌ — удалить")
+        lines.append("\n✏️ — переименовать, 📞 — телефон, ❌ — удалить")
         await _send(chat_id, "\n".join(lines), kb.as_markup())
 
     elif payload == "menu_test":
@@ -492,6 +495,21 @@ async def _confirm_action(chat_id: int, payload: str) -> None:
         _pending_state[chat_id] = f"rename:{platform}:{cid_str}"
         await _send(chat_id, f"✏️ Введите новое имя для «{cur}» (как Алисе удобнее произносить):", _cancel_kb())
 
+    elif payload.startswith("phone:"):
+        owner = await _active_owner(chat_id)
+        if not owner:
+            return
+        _, platform, cid_str = payload.split(":")
+        contacts = await db.get_contacts(owner.chat_id)
+        c = next((x for x in contacts if x.chat_id == int(cid_str) and x.platform == platform), None)
+        cur = (c.phone if c and c.phone else "не задан")
+        name = c.name if c else cid_str
+        _pending_state[chat_id] = f"setphone:{platform}:{cid_str}"
+        await _send(chat_id,
+                    f"📞 Телефон для «{name}» (для дозвона через «Телефон»).\n\n"
+                    f"Сейчас: {cur}\n\nПришлите номер (+79991234567) или «-», чтобы удалить.",
+                    _cancel_kb())
+
     elif payload == "checkin_ok":
         await checkin_module.confirm(chat_id)
         await _send(chat_id, "✅ Отметка принята. Всё хорошо!")
@@ -511,6 +529,24 @@ async def _handle_text(chat_id: int, name: str, text: str) -> None:
         return
 
     state = _pending_state.pop(chat_id, None)
+
+    if state and state.startswith("setphone:"):
+        owner = await _active_owner(chat_id)
+        if not owner:
+            return
+        _, platform, cid_str = state.split(":")
+        if text in ("-", "—", "нет", "off", "выкл"):
+            await db.set_contact_phone(owner.chat_id, int(cid_str), platform, "")
+            await _send(chat_id, "📞 Телефон удалён.", _menu_kb())
+            return
+        phone = db.normalize_phone(text)
+        if not phone:
+            _pending_state[chat_id] = state
+            await _send(chat_id, "Некорректный номер. Пример: +79991234567. Пришлите ещё раз или «-».", _cancel_kb())
+            return
+        await db.set_contact_phone(owner.chat_id, int(cid_str), platform, phone)
+        await _send(chat_id, f"✅ Телефон сохранён: {phone}", _menu_kb())
+        return
 
     if state and state.startswith("rename:"):
         owner = await _active_owner(chat_id)

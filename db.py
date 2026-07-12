@@ -18,6 +18,16 @@ def set_restoring(value: bool) -> None:
     _restoring = value
 
 
+def normalize_phone(raw: str) -> str | None:
+    """Clean a phone number to '+<digits>' / '<digits>'. None if too short."""
+    raw = (raw or "").strip()
+    plus = raw.lstrip().startswith("+")
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) < 5:
+        return None
+    return ("+" if plus else "") + digits
+
+
 @dataclass
 class Owner:
     chat_id: int
@@ -36,6 +46,7 @@ class Contact:
     chat_id: int
     name: str
     platform: str = TELEGRAM
+    phone: str = ""
 
     def first_name(self) -> str:
         return self.name.split()[0] if self.name else self.name
@@ -63,6 +74,7 @@ async def init(path: str) -> None:
             chat_id   INTEGER NOT NULL,
             name      TEXT    NOT NULL,
             platform  TEXT    NOT NULL DEFAULT 'telegram',
+            phone     TEXT    NOT NULL DEFAULT '',
             UNIQUE(owner_id, chat_id, platform)
         );
         CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_id);
@@ -98,6 +110,7 @@ async def init(path: str) -> None:
         ("owners", "status", "ALTER TABLE owners ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
         ("owners", "platform", "ALTER TABLE owners ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
         ("contacts", "platform", "ALTER TABLE contacts ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
+        ("contacts", "phone", "ALTER TABLE contacts ADD COLUMN phone TEXT NOT NULL DEFAULT ''"),
         ("replies", "platform", "ALTER TABLE replies ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
         ("owners", "sos_webhook_url", "ALTER TABLE owners ADD COLUMN sos_webhook_url TEXT NOT NULL DEFAULT ''"),
         ("owners", "sos_email", "ALTER TABLE owners ADD COLUMN sos_email TEXT NOT NULL DEFAULT ''"),
@@ -232,11 +245,12 @@ async def delete_owner(chat_id: int) -> None:
 
 async def get_contacts(owner_id: int) -> list[Contact]:
     async with _conn_or_error().execute(
-        "SELECT chat_id, name, platform FROM contacts WHERE owner_id = ? ORDER BY id",
+        "SELECT chat_id, name, platform, phone FROM contacts WHERE owner_id = ? ORDER BY id",
         (owner_id,),
     ) as cur:
         rows = await cur.fetchall()
-    return [Contact(chat_id=r["chat_id"], name=r["name"], platform=r["platform"]) for r in rows]
+    return [Contact(chat_id=r["chat_id"], name=r["name"], platform=r["platform"],
+                    phone=r["phone"] if "phone" in r.keys() else "") for r in rows]
 
 
 async def add_contact(owner_id: int, chat_id: int, name: str,
@@ -278,6 +292,17 @@ async def rename_contact(owner_id: int, chat_id: int, platform: str, new_name: s
         "UPDATE replies SET contact_name = ? "
         "WHERE owner_id = ? AND contact_id = ? AND platform = ?",
         (new_name, owner_id, chat_id, platform),
+    )
+    await conn.commit()
+    return cur.rowcount > 0
+
+
+async def set_contact_phone(owner_id: int, chat_id: int, platform: str, phone: str) -> bool:
+    """Set/clear a contact's phone number. Returns True if it existed."""
+    conn = _conn_or_error()
+    cur = await conn.execute(
+        "UPDATE contacts SET phone = ? WHERE owner_id = ? AND chat_id = ? AND platform = ?",
+        (phone, owner_id, chat_id, platform),
     )
     await conn.commit()
     return cur.rowcount > 0

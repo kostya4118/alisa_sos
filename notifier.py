@@ -24,6 +24,7 @@ async def notify_integrations(
     *,
     extra_message: str = "",
     target: str | None = None,
+    target_phone: str = "",
     recipients: int = 0,
     failed: int = 0,
     kind: str = "sos",
@@ -49,6 +50,7 @@ async def notify_integrations(
             "time": datetime.now(tz).isoformat(),
             "message": extra_message,
             "target": target,
+            "phone": target_phone,
             "recipients": recipients,
             "failed": failed,
         }
@@ -57,7 +59,13 @@ async def notify_integrations(
 
     if target and owner.sos_email and email_out.enabled():
         subject = f"SOS: {target}"
-        body = f"{extra_message or 'Нужна помощь!'}\n\nОт: {owner.name}"
+        # Machine-parsable lines for the iPhone Shortcut (phone → call/SMS by number).
+        body = (
+            f"Телефон: {target_phone or 'не задан'}\n"
+            f"Сообщение: {extra_message or 'Нужна помощь!'}\n"
+            f"Контакт: {target}\n"
+            f"От: {owner.name}"
+        )
         _schedule(email_out.send(owner.sos_email, subject, body))
         fired = True
 

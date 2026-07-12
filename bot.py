@@ -949,14 +949,19 @@ async def cmd_contacts(message: Message) -> None:
 
     lines = [f"👥 Подписчики ({len(contacts)}):\n"]
     for i, c in enumerate(contacts, 1):
-        lines.append(f"{i}. {_tag(c.platform)} {c.name}")
-    lines.append("\n✏️ — переименовать (удобно для Алисы), ❌ — удалить")
+        ph = f" 📞 {c.phone}" if c.phone else ""
+        lines.append(f"{i}. {_tag(c.platform)} {c.name}{ph}")
+    lines.append("\n✏️ — переименовать, 📞 — телефон (для дозвона), ❌ — удалить")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text=f"✏️ {_tag(c.platform)} {c.name}",
+                text=f"✏️ {c.name}",
                 callback_data=f"rename:{c.platform}:{c.chat_id}",
+            ),
+            InlineKeyboardButton(
+                text="📞",
+                callback_data=f"phone:{c.platform}:{c.chat_id}",
             ),
             InlineKeyboardButton(
                 text="❌",
@@ -997,6 +1002,26 @@ async def callback_rename_contact(callback: CallbackQuery) -> None:
     await callback.message.answer(
         f"✏️ Введите новое имя для «{cur_name}»\n"
         "(как Алисе удобнее его произносить):",
+        reply_markup=_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("phone:"))
+async def callback_contact_phone(callback: CallbackQuery) -> None:
+    owner = await _get_active_owner_cb(callback)
+    if not owner:
+        return
+    _, platform, chat_id_str = callback.data.split(":")
+    contacts = await db.get_contacts(owner.chat_id)
+    c = next((x for x in contacts if x.chat_id == int(chat_id_str) and x.platform == platform), None)
+    cur = (c.phone if c and c.phone else "не задан")
+    name = c.name if c else chat_id_str
+    _pending_state[callback.from_user.id] = f"setphone:{platform}:{chat_id_str}"
+    await callback.message.answer(
+        f"📞 Телефон для «{name}» (для дозвона через «Телефон» у Алисы).\n\n"
+        f"Сейчас: {cur}\n\n"
+        "Пришлите номер в формате +79991234567 или «-», чтобы удалить.",
         reply_markup=_cancel_keyboard(),
     )
     await callback.answer()
@@ -1137,6 +1162,28 @@ async def handle_text(message: Message) -> None:
 
     chat_id = message.from_user.id
     state = _pending_state.pop(chat_id, None)
+
+    if state and state.startswith("setphone:"):
+        owner = await _get_active_owner(chat_id, message)
+        if not owner:
+            return
+        _, platform, cid_str = state.split(":")
+        raw = message.text.strip()
+        if raw in ("-", "—", "нет", "off", "выкл"):
+            await db.set_contact_phone(owner.chat_id, int(cid_str), platform, "")
+            await message.answer("📞 Телефон удалён.", reply_markup=_owner_keyboard())
+            return
+        phone = db.normalize_phone(raw)
+        if not phone:
+            _pending_state[chat_id] = state
+            await message.answer(
+                "Некорректный номер. Пример: +79991234567. Пришлите ещё раз или «-».",
+                reply_markup=_cancel_keyboard(),
+            )
+            return
+        await db.set_contact_phone(owner.chat_id, int(cid_str), platform, phone)
+        await message.answer(f"✅ Телефон сохранён: {phone}", reply_markup=_owner_keyboard())
+        return
 
     if state and state.startswith("rename:"):
         owner = await _get_active_owner(chat_id, message)
