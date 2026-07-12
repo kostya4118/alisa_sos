@@ -99,6 +99,7 @@ def _settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🕐 Изменить часовой пояс", callback_data="cfg_tz")],
         [InlineKeyboardButton(text="⏰ Авточек", callback_data="cfg_checkin")],
         [InlineKeyboardButton(text="🔗 Webhook при SOS", callback_data="cfg_webhook")],
+        [InlineKeyboardButton(text="📧 E-mail для дозвона", callback_data="cfg_email")],
         [InlineKeyboardButton(text="🗑 Удалить аккаунт", callback_data="cfg_delete")],
     ])
 
@@ -636,11 +637,13 @@ async def cmd_settings_menu(message: Message) -> None:
     if not owner:
         return
     hook = owner.sos_webhook_url or "не задан"
+    mail = owner.sos_email or "не задан"
     await message.answer(
         f"⚙️ <b>Редактирование настроек</b>\n\n"
         f"👤 Имя: {owner.name}\n"
         f"🕐 Часовой пояс: UTC{owner.tz_offset:+d}\n"
         f"🔗 Webhook при SOS: {hook}\n"
+        f"📧 E-mail для дозвона: {mail}\n"
         f"📢 Текст SOS:\n{owner.sos_message}",
         parse_mode="HTML",
         reply_markup=_settings_keyboard(),
@@ -694,6 +697,28 @@ async def callback_cfg_webhook(callback: CallbackQuery) -> None:
         "Pushcut (звонок/SMS с iPhone), IFTTT, n8n, умный дом или свой скрипт.\n\n"
         f"Сейчас: <code>{cur}</code>\n\n"
         "Пришлите URL (https://...) или «-», чтобы отключить.",
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cfg_email")
+async def callback_cfg_email(callback: CallbackQuery) -> None:
+    owner = await _get_active_owner_cb(callback)
+    if not owner:
+        return
+    from email_out import enabled as _email_enabled
+    _pending_state[callback.from_user.id] = "set_email"
+    cur = owner.sos_email or "не задан"
+    note = "" if _email_enabled() else "\n\n⚠️ На сервере не настроен SMTP — письма пока отправляться не будут."
+    await callback.message.answer(
+        "📧 <b>E-mail для дозвона</b>\n\n"
+        "При выборе «Телефон» у Алисы бот отправит письмо на этот адрес "
+        "(тема «SOS: имя», в теле — сообщение). На iPhone автоматизация "
+        "«E-mail → Выполнять сразу» по нему позвонит и напишет контакту.\n\n"
+        f"Сейчас: <code>{cur}</code>{note}\n\n"
+        "Пришлите адрес или «-», чтобы отключить.",
         parse_mode="HTML",
         reply_markup=_cancel_keyboard(),
     )
@@ -1169,6 +1194,28 @@ async def handle_text(message: Message) -> None:
         await message.answer(
             f"✅ Webhook при SOS сохранён:\n{val}\n\n"
             "Проверьте кнопкой «🆘 Тест SOS» — на адрес придёт POST с event=test.",
+            reply_markup=_owner_keyboard(),
+        )
+        return
+
+    if state == "set_email":
+        owner = await _get_active_owner(chat_id, message)
+        if not owner:
+            return
+        val = message.text.strip()
+        if val in ("-", "—", "нет", "off", "выкл"):
+            await db.update_owner(chat_id, sos_email="")
+            await message.answer("📧 E-mail для дозвона отключён.", reply_markup=_owner_keyboard())
+            return
+        if "@" not in val or "." not in val.split("@")[-1] or " " in val:
+            _pending_state[chat_id] = "set_email"
+            await message.answer("Некорректный адрес. Пришлите e-mail ещё раз или «-».",
+                                 reply_markup=_cancel_keyboard())
+            return
+        await db.update_owner(chat_id, sos_email=val)
+        await message.answer(
+            f"✅ E-mail для дозвона сохранён:\n{val}\n\n"
+            "Проверьте: скажите Алисе «Телефон» → выберите контакт → сообщение — на почту придёт письмо.",
             reply_markup=_owner_keyboard(),
         )
         return

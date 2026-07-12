@@ -28,6 +28,7 @@ class Owner:
     status: str = field(default="active")      # "pending" | "active"
     platform: str = field(default=TELEGRAM)    # "telegram" | "max"
     sos_webhook_url: str = field(default="")   # optional outbound webhook on SOS
+    sos_email: str = field(default="")         # optional e-mail bridge for "Телефон"
 
 
 @dataclass
@@ -99,6 +100,7 @@ async def init(path: str) -> None:
         ("contacts", "platform", "ALTER TABLE contacts ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
         ("replies", "platform", "ALTER TABLE replies ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
         ("owners", "sos_webhook_url", "ALTER TABLE owners ADD COLUMN sos_webhook_url TEXT NOT NULL DEFAULT ''"),
+        ("owners", "sos_email", "ALTER TABLE owners ADD COLUMN sos_email TEXT NOT NULL DEFAULT ''"),
     ):
         try:
             await _conn.execute(ddl)
@@ -150,6 +152,7 @@ def _row_to_owner(row) -> Owner:
         status=d.get("status", "active"),
         platform=d.get("platform", TELEGRAM),
         sos_webhook_url=d.get("sos_webhook_url", "") or "",
+        sos_email=d.get("sos_email", "") or "",
     )
 
 
@@ -204,7 +207,7 @@ async def set_owner_status(chat_id: int, status: str) -> None:
 
 
 async def update_owner(chat_id: int, **fields) -> None:
-    allowed = {"name", "sos_message", "tz_offset", "sos_webhook_url"}
+    allowed = {"name", "sos_message", "tz_offset", "sos_webhook_url", "sos_email"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return

@@ -66,6 +66,7 @@ def _settings_kb():
     kb.row(CallbackButton(text="🕐 Изменить часовой пояс", payload="cfg_tz"))
     kb.row(CallbackButton(text="⏰ Авточек", payload="cfg_checkin"))
     kb.row(CallbackButton(text="🔗 Webhook при SOS", payload="cfg_webhook"))
+    kb.row(CallbackButton(text="📧 E-mail для дозвона", payload="cfg_email"))
     kb.row(CallbackButton(text="🗑 Удалить аккаунт", payload="cfg_delete"))
     kb.row(CallbackButton(text="⬅️ Меню", payload="menu_home"))
     return kb.as_markup()
@@ -406,6 +407,20 @@ async def _settings_action(chat_id: int, payload: str) -> None:
             "Пришлите URL (https://...) или «-», чтобы отключить.",
             _cancel_kb(),
         )
+    elif payload == "cfg_email":
+        import email_out
+        _pending_state[chat_id] = "set_email"
+        cur = owner.sos_email or "не задан"
+        note = "" if email_out.enabled() else "\n\n⚠️ На сервере не настроен SMTP — письма пока не будут отправляться."
+        await _send(
+            chat_id,
+            "📧 E-mail для дозвона.\n\n"
+            "При выборе «Телефон» у Алисы бот шлёт письмо на этот адрес; на iPhone "
+            "автоматизация «E-mail → Выполнять сразу» звонит и пишет контакту.\n\n"
+            f"Сейчас: {cur}{note}\n\n"
+            "Пришлите адрес или «-», чтобы отключить.",
+            _cancel_kb(),
+        )
     elif payload == "cfg_cancel":
         _pending_state.pop(chat_id, None)
         await _send(chat_id, "Отменено.", _menu_kb())
@@ -522,6 +537,21 @@ async def _handle_text(chat_id: int, name: str, text: str) -> None:
             return
         await db.update_owner(chat_id, sos_webhook_url=text)
         await _send(chat_id, f"✅ Webhook при SOS сохранён:\n{text}", _menu_kb())
+        return
+
+    if state == "set_email":
+        if not await _active_owner(chat_id):
+            return
+        if text in ("-", "—", "нет", "off", "выкл"):
+            await db.update_owner(chat_id, sos_email="")
+            await _send(chat_id, "📧 E-mail для дозвона отключён.", _menu_kb())
+            return
+        if "@" not in text or "." not in text.split("@")[-1] or " " in text:
+            _pending_state[chat_id] = "set_email"
+            await _send(chat_id, "Некорректный адрес. Пришлите e-mail ещё раз или «-».", _cancel_kb())
+            return
+        await db.update_owner(chat_id, sos_email=text)
+        await _send(chat_id, f"✅ E-mail для дозвона сохранён:\n{text}", _menu_kb())
         return
 
     if state == "set_name":

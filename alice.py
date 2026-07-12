@@ -13,6 +13,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 
 import db
+import email_out
 import messaging
 import notifier
 
@@ -56,16 +57,21 @@ def _contact_first_names(contacts: list[db.Contact]) -> str:
     return ", ".join(c.first_name() for c in contacts)
 
 
-def _sos_prompt(count: int, has_webhook: bool, prefix: str = "") -> tuple[str, list[str]]:
+def _has_phone_bridge(owner: db.Owner) -> bool:
+    """True if the owner has a way to trigger a phone call/SMS (webhook or e-mail)."""
+    return bool(owner.sos_webhook_url) or (bool(owner.sos_email) and email_out.enabled())
+
+
+def _sos_prompt(count: int, has_phone: bool, prefix: str = "") -> tuple[str, list[str]]:
     """Recipient question text + buttons; adds the 'Телефон' option when the
-    owner has an outbound webhook configured."""
+    owner has a phone bridge (webhook or e-mail) configured."""
     if count > 1:
-        if has_webhook:
+        if has_phone:
             return (f"{prefix}Отправить SOS всем {count} контактам, одному или на телефон?",
                     ["Всем", "Одному", "Телефон"])
         return (f"{prefix}Отправить SOS всем {count} контактам или одному?",
                 ["Всем", "Одному"])
-    if has_webhook:
+    if has_phone:
         return f"{prefix}Отправить SOS или на телефон?", ["Да", "Телефон"]
     return f"{prefix}Отправить SOS?", ["Да"]
 
@@ -124,7 +130,7 @@ async def alice_webhook(webhook_token: str, request: Request):
             )
         cnt = len(await db.get_contacts(owner.chat_id))
         _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-        text, sos_btns = _sos_prompt(cnt, bool(owner.sos_webhook_url), prefix)
+        text, sos_btns = _sos_prompt(cnt, _has_phone_bridge(owner), prefix)
         return _alice_response(text, buttons=sos_btns)
 
     if is_new_session:
@@ -152,7 +158,7 @@ async def alice_webhook(webhook_token: str, request: Request):
             )
         count = len(contacts)
         _sessions[session_id] = {"state": "awaiting_recipient", "owner_id": owner.chat_id}
-        text, buttons = _sos_prompt(count, bool(owner.sos_webhook_url),
+        text, buttons = _sos_prompt(count, _has_phone_bridge(owner),
                                     "Навык экстренного оповещения. ")
         return _alice_response(text, buttons=buttons)
 
@@ -260,8 +266,8 @@ async def alice_webhook(webhook_token: str, request: Request):
             _sessions.pop(session_id, None)
             return _alice_response("Отменено. Будьте в безопасности.", end_session=True)
 
-        # "Через телефон" — trigger the outbound webhook for a chosen contact.
-        if owner.sos_webhook_url and _has(_PHONE_WORDS):
+        # "Телефон" — trigger the phone bridge (webhook/e-mail) for a chosen contact.
+        if _has_phone_bridge(owner) and _has(_PHONE_WORDS):
             contacts = await db.get_contacts(owner.chat_id)
             if not contacts:
                 _sessions.pop(session_id, None)
@@ -422,9 +428,9 @@ async def alice_webhook(webhook_token: str, request: Request):
         extra = ""
         if not _has(_DONE_WORDS) and not _has(_NOMSG_WORDS):
             extra = utterance or command
-        fired = await notifier.fire_sos_webhook(owner, extra_message=extra, target=target, kind="sos")
+        fired = await notifier.notify_integrations(owner, extra_message=extra, target=target, kind="sos")
         _sessions.pop(session_id, None)
-        logger.info("Alice phone-webhook owner=%d target=%r fired=%s extra=%r",
+        logger.info("Alice phone-bridge owner=%d target=%r fired=%s extra=%r",
                     owner.chat_id, target, fired, extra)
         if fired:
             return _alice_response(
@@ -432,7 +438,7 @@ async def alice_webhook(webhook_token: str, request: Request):
                 end_session=True,
             )
         return _alice_response(
-            "Не удалось: webhook не настроен. Задайте его в боте в настройках.",
+            "Не удалось: телефон-мост не настроен. Задайте webhook или e-mail в настройках.",
             end_session=True,
         )
 

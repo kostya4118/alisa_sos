@@ -3,13 +3,23 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 import db
+import email_out
 import messaging
 import webhook_out
 
 logger = logging.getLogger(__name__)
 
 
-async def fire_sos_webhook(
+def _schedule(coro) -> None:
+    """Run a coroutine fire-and-forget (never blocks the caller)."""
+    try:
+        asyncio.create_task(coro)
+    except RuntimeError:
+        # No running loop (shouldn't happen in the bot) — run it now.
+        asyncio.get_event_loop().run_until_complete(coro)
+
+
+async def notify_integrations(
     owner: db.Owner,
     *,
     extra_message: str = "",
@@ -18,34 +28,40 @@ async def fire_sos_webhook(
     failed: int = 0,
     kind: str = "sos",
 ) -> bool:
-    """Fire the owner's outbound SOS webhook (fire-and-forget).
+    """Fire the owner's external SOS integrations (fire-and-forget).
 
-    ``target`` is the chosen contact's name (for the "через телефон" flow) so
-    the receiving automation can call/SMS that specific person; None for a
-    normal broadcast SOS.
+    - Outbound webhook: on every SOS if ``sos_webhook_url`` is set.
+    - E-mail "Телефон" bridge: only when a specific ``target`` contact is
+      chosen and ``sos_email`` + SMTP are configured.
 
-    Returns True if a request was scheduled (i.e. the owner has a webhook).
-    Never blocks: uses a background task so Alice/Telegram stay responsive.
+    ``target`` is the chosen contact's name so the receiving automation can
+    call/SMS that person. Returns True if at least one channel fired.
+    Never blocks: Alice/Telegram stay responsive.
     """
-    if not owner.sos_webhook_url:
-        return False
-    tz = timezone(timedelta(hours=owner.tz_offset))
-    payload = {
-        "event": kind,
-        "owner": owner.name,
-        "owner_id": owner.chat_id,
-        "time": datetime.now(tz).isoformat(),
-        "message": extra_message,
-        "target": target,
-        "recipients": recipients,
-        "failed": failed,
-    }
-    try:
-        asyncio.create_task(webhook_out.fire(owner.sos_webhook_url, payload))
-    except RuntimeError:
-        # No running loop (shouldn't happen in the bot) — send inline.
-        await webhook_out.fire(owner.sos_webhook_url, payload)
-    return True
+    fired = False
+
+    if owner.sos_webhook_url:
+        tz = timezone(timedelta(hours=owner.tz_offset))
+        payload = {
+            "event": kind,
+            "owner": owner.name,
+            "owner_id": owner.chat_id,
+            "time": datetime.now(tz).isoformat(),
+            "message": extra_message,
+            "target": target,
+            "recipients": recipients,
+            "failed": failed,
+        }
+        _schedule(webhook_out.fire(owner.sos_webhook_url, payload))
+        fired = True
+
+    if target and owner.sos_email and email_out.enabled():
+        subject = f"SOS: {target}"
+        body = f"{extra_message or 'Нужна помощь!'}\n\nОт: {owner.name}"
+        _schedule(email_out.send(owner.sos_email, subject, body))
+        fired = True
+
+    return fired
 
 
 async def send_sos(
@@ -96,9 +112,9 @@ async def send_sos(
         except Exception:
             logger.exception("Failed to record SOS recipient %d", contact.chat_id)
 
-    # Fire the owner's outbound webhook (fire-and-forget — never blocks SOS).
-    await fire_sos_webhook(owner, extra_message=extra_message,
-                           recipients=sent, failed=failed, kind=kind)
+    # Fire the owner's external integrations (fire-and-forget — never blocks SOS).
+    await notify_integrations(owner, extra_message=extra_message,
+                              recipients=sent, failed=failed, kind=kind)
 
     try:
         await messaging.send(
