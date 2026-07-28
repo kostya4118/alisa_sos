@@ -14,6 +14,11 @@ Login: on first start PyMax asks for an SMS code; we ask the admin for it in
 Telegram (``/maxcode 1234``). If the account has 2FA, the password comes from
 ``MAX_USERBOT_PASSWORD`` or is requested via ``/maxpassword``. The session is
 saved under ``data/`` and reused.
+
+The MAX SMS code expires fast (~1–2 min). If login fails (expired code, rate
+limit, dropped connection) the userbot waits with backoff and retries from
+scratch — requesting a fresh SMS — instead of dying until the next container
+restart.
 """
 
 import asyncio
@@ -139,23 +144,13 @@ def _extract_my_id(me) -> int | None:
     return None
 
 
-async def run() -> None:
-    """Start the userbot and keep it connected (background task)."""
-    global _client, _me_id
-    from pymax import Client
+def _attach_handlers(client) -> None:
+    """Register on_start / on_message handlers on a fresh client instance."""
 
-    _client = Client(
-        phone=settings.max_userbot_phone,
-        session_name="userbot.db",
-        work_dir=_work_dir(),
-        sms_code_provider=_BotSmsCodeProvider(),
-        password_provider=_BotPasswordProvider(),
-    )
-
-    @_client.on_start()
+    @client.on_start()
     async def _on_start() -> None:  # noqa: ANN202
         global _me_id
-        me = _client.me
+        me = client.me
         logger.info("MAX userbot connected. me=%r", me)
         _me_id = _extract_my_id(me)
         if _me_id is None:
@@ -165,8 +160,8 @@ async def run() -> None:
 
     # Inbound: a MAX user wrote to our service account → treat as a subscriber
     # reply and forward it to the owner(s), matching by the dialog chat_id.
-    @_client.on_message()
-    async def _on_incoming(message, client) -> None:  # noqa: ANN001, ANN202
+    @client.on_message()
+    async def _on_incoming(message, c) -> None:  # noqa: ANN001, ANN202
         try:
             sender = getattr(message, "sender", None)
             text = getattr(message, "text", None)
@@ -178,7 +173,7 @@ async def run() -> None:
                 phone = await db.get_max_phone_by_user(sender)
                 if not phone:
                     try:
-                        u = await client.get_user(sender)
+                        u = await c.get_user(sender)
                         raw = getattr(u, "phone", None)
                         if raw:
                             phone = db.normalize_phone(str(raw))
@@ -193,14 +188,60 @@ async def run() -> None:
         except Exception:
             logger.exception("MAX inbound handler error")
 
-    logger.info("Starting MAX userbot (%s)...", settings.max_userbot_phone)
-    try:
-        await _client.start()   # connects, authorizes, then runs the receive loop
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("MAX userbot stopped with an error")
+
+def _is_transient_auth_error(err: Exception) -> bool:
+    """Expired SMS code / attempt-limit / code errors — worth requesting anew."""
+    msg = str(err).lower()
+    return any(k in msg for k in ("устарел", "attempt.limit", "code", "sms", "устар"))
+
+
+async def run() -> None:
+    """Start the userbot and keep it connected, retrying login on failure."""
+    global _client, _me_id
+    from pymax import Client
+
+    backoff = 60
+    while True:
         _ready.clear()
+        _me_id = None
+        _client = Client(
+            phone=settings.max_userbot_phone,
+            session_name="userbot.db",
+            work_dir=_work_dir(),
+            sms_code_provider=_BotSmsCodeProvider(),
+            password_provider=_BotPasswordProvider(),
+        )
+        _attach_handlers(_client)
+
+        logger.info("Starting MAX userbot (%s)...", settings.max_userbot_phone)
+        try:
+            # connects, authorizes, then runs the receive loop until disconnect
+            await _client.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            _ready.clear()
+            logger.exception("MAX userbot login/run failed")
+            if _is_transient_auth_error(err):
+                wait = max(backoff, 90)
+                reason = "код устарел или превышен лимит попыток"
+            else:
+                wait = backoff
+                reason = "ошибка входа/соединения"
+            await _notify_admin(
+                f"⚠️ MAX-аккаунт: {reason}. Повторю попытку входа через "
+                f"{wait} сек — держите наготове новый SMS-код (/maxcode 1234)."
+            )
+            await asyncio.sleep(wait)
+            backoff = min(backoff * 2, 600)
+            continue
+
+        # start() returned cleanly = the connection dropped; reconnect (the
+        # saved session is reused, so no SMS is needed).
+        _ready.clear()
+        backoff = 60
+        logger.info("MAX userbot disconnected; reconnecting in 30s")
+        await asyncio.sleep(30)
 
 
 # ---------------------------------------------------------------------------
