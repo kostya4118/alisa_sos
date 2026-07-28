@@ -378,11 +378,21 @@ async def alice_webhook(webhook_token: str, request: Request):
         recipient: dict | None = state_data.get("recipient")
         contacts_subset = None
         if recipient is not None:
-            contacts_subset = [db.Contact(
-                chat_id=recipient["chat_id"],
-                name=recipient["name"],
-                platform=recipient["platform"],
-            )]
+            # Pull the real contact from the DB so it carries the phone (needed
+            # for the MAX mirror) and any other fields — the session dict only
+            # holds chat_id/name/platform.
+            all_contacts = await db.get_contacts(owner.chat_id)
+            contacts_subset = [
+                c for c in all_contacts
+                if c.chat_id == recipient["chat_id"]
+                and c.platform == recipient["platform"]
+            ]
+            if not contacts_subset:  # contact removed meanwhile — fall back
+                contacts_subset = [db.Contact(
+                    chat_id=recipient["chat_id"],
+                    name=recipient["name"],
+                    platform=recipient["platform"],
+                )]
         sent, failed = await notifier.send_sos(owner, extra_message=extra, contacts=contacts_subset)
         _sessions.pop(session_id, None)
 
