@@ -250,16 +250,53 @@ async def run() -> None:
 # Resolving & sending
 # ---------------------------------------------------------------------------
 
+def _phone_variants(phone: str) -> list[str]:
+    """Formats MAX might expect: as stored, digits-only, and +digits.
+
+    MAX returns its own numbers as bare digits (e.g. 79991234567), so a stored
+    ``+7…`` may not match search_by_phone — we try both.
+    """
+    p = (phone or "").strip()
+    digits = "".join(ch for ch in p if ch.isdigit())
+    out: list[str] = []
+    for v in (p, digits, ("+" + digits) if digits else ""):
+        v = v.strip()
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
 async def resolve(phone: str) -> tuple[int, int]:
-    """Resolve a phone → (dialog chat_id, user_id). Cached in max_peer."""
+    """Resolve a phone → (dialog chat_id, user_id). Cached in max_peer.
+
+    Tries several phone formats (MAX is picky about the leading ``+``) and
+    surfaces the underlying MAX error if the person can't be found.
+    """
     if not is_ready():
         raise RuntimeError("MAX userbot не готов (нет входа в аккаунт)")
     if _me_id is None:
         raise RuntimeError("MAX: неизвестен собственный id аккаунта")
-    user = await _client.search_by_phone(phone)
-    their_id = getattr(user, "id", None) or getattr(user, "user_id", None)
+
+    their_id = None
+    last_err: Exception | None = None
+    for variant in _phone_variants(phone):
+        try:
+            user = await _client.search_by_phone(variant)
+        except Exception as e:  # noqa: BLE001 — try the next format
+            last_err = e
+            logger.info("MAX search_by_phone(%s) error: %s", variant, e)
+            continue
+        tid = getattr(user, "id", None) or getattr(user, "user_id", None)
+        if tid is not None:
+            their_id = tid
+            break
+        logger.info("MAX search_by_phone(%s) → no user", variant)
+
     if their_id is None:
-        raise RuntimeError(f"MAX: пользователь с номером {phone} не найден")
+        if last_err is not None:
+            raise RuntimeError(f"MAX: не удалось найти {phone}: {last_err}") from last_err
+        raise RuntimeError(f"MAX: пользователь с номером {phone} не зарегистрирован в MAX")
+
     chat_id = await _client.get_chat_id(_me_id, their_id)
     await db.set_max_peer(phone, chat_id, their_id)
     return chat_id, their_id
