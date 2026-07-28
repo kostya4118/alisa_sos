@@ -148,9 +148,10 @@ def _attach_handlers(client) -> None:
     """Register on_start / on_message handlers on a fresh client instance."""
 
     @client.on_start()
-    async def _on_start() -> None:  # noqa: ANN202
+    async def _on_start(started) -> None:  # noqa: ANN001, ANN202
+        # PyMax calls on_start handlers as ``handler(client)`` — must accept it.
         global _me_id
-        me = client.me
+        me = started.me
         logger.info("MAX userbot connected. me=%r", me)
         _me_id = _extract_my_id(me)
         if _me_id is None:
