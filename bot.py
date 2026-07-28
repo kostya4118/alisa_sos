@@ -520,15 +520,26 @@ async def cmd_addmax(message: Message) -> None:
     if not phone or not name:
         await message.answer("Пример: /addmax Мама +79991234567")
         return
-    cid = int(phone.lstrip("+"))  # phone digits as a synthetic chat_id (unique per number)
-    added = await db.add_contact(owner.chat_id, cid, name, db.MAX)
+    import max_user
+    if not max_user.enabled():
+        await message.answer("MAX-userbot выключен (не задан MAX_USERBOT_PHONE).")
+        return
+    if not max_user.is_ready():
+        await message.answer("MAX-аккаунт не подключён. Проверьте /maxstatus и вход через /maxcode.")
+        return
+    try:
+        chat_id, _uid = await max_user.resolve(phone)   # real MAX dialog chat_id
+    except Exception as exc:
+        await message.answer(f"Не удалось найти пользователя MAX с номером {phone}.\n{exc}")
+        return
+    added = await db.add_contact(owner.chat_id, chat_id, name, db.MAX)
     if not added:
         await message.answer("Такой MAX-контакт уже добавлен.")
         return
-    await db.set_contact_phone(owner.chat_id, cid, db.MAX, phone)
+    await db.set_contact_phone(owner.chat_id, chat_id, db.MAX, phone)
     await message.answer(
         f"✅ MAX-контакт добавлен: {name} ({phone}).\n"
-        "SOS и сообщения будут уходить ему в MAX через сервисный аккаунт."
+        "SOS и его ответы будут ходить через сервисный аккаунт MAX."
     )
 
 

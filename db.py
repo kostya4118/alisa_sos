@@ -103,6 +103,12 @@ async def init(path: str) -> None:
             sent_at    INTEGER NOT NULL,
             PRIMARY KEY (contact_id, platform, owner_id)
         );
+        CREATE TABLE IF NOT EXISTS max_peer (
+            phone    TEXT    PRIMARY KEY,
+            chat_id  INTEGER,
+            user_id  INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_max_peer_user ON max_peer(user_id);
     """)
     await _conn.commit()
     # Idempotent column additions for installations created before these columns existed.
@@ -402,6 +408,35 @@ async def get_last_sos_owner(contact_id: int, platform: str = TELEGRAM) -> int |
     ) as cur:
         row = await cur.fetchone()
     return row["owner_id"] if row else None
+
+
+async def set_max_peer(phone: str, chat_id: int | None = None, user_id: int | None = None) -> None:
+    """Cache the MAX dialog for a phone (learned when we resolve/receive)."""
+    conn = _conn_or_error()
+    await conn.execute(
+        "INSERT INTO max_peer(phone, chat_id, user_id) VALUES (?, ?, ?) "
+        "ON CONFLICT(phone) DO UPDATE SET "
+        "chat_id = COALESCE(excluded.chat_id, max_peer.chat_id), "
+        "user_id = COALESCE(excluded.user_id, max_peer.user_id)",
+        (phone, chat_id, user_id),
+    )
+    await conn.commit()
+
+
+async def get_max_chat_id(phone: str) -> int | None:
+    async with _conn_or_error().execute(
+        "SELECT chat_id FROM max_peer WHERE phone = ?", (phone,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row["chat_id"] if row and row["chat_id"] is not None else None
+
+
+async def get_max_phone_by_user(user_id: int) -> str | None:
+    async with _conn_or_error().execute(
+        "SELECT phone FROM max_peer WHERE user_id = ?", (user_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row["phone"] if row else None
 
 
 async def get_recent_sos_owners(contact_id: int, platform: str = TELEGRAM,

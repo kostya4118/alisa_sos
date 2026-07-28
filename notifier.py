@@ -106,7 +106,7 @@ async def send_sos(
     failed = 0
     for contact in targets:
         try:
-            await messaging.send(contact.platform, contact.chat_id, text, phone=contact.phone)
+            await messaging.send(contact.platform, contact.chat_id, text)
             sent += 1
             logger.info("SOS sent to %s (%d/%s) for owner %d",
                         contact.name, contact.chat_id, contact.platform, owner.chat_id)

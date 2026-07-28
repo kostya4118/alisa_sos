@@ -127,6 +127,36 @@ async def run() -> None:
         _ready.set()
         await _notify_admin("✅ MAX-аккаунт подключён. Дозвон/сообщения в MAX активны.")
 
+    # Inbound: a MAX user wrote to our service account → treat as a subscriber
+    # reply and forward it to the owner(s), matching by the dialog chat_id.
+    @_client.on_message()
+    async def _on_incoming(message, client) -> None:  # noqa: ANN001, ANN202
+        try:
+            sender = getattr(message, "sender", None)
+            text = getattr(message, "text", None)
+            chat_id = getattr(message, "chat_id", None)
+            if not text or chat_id is None or sender == _me_id:
+                return
+            # Learn phone↔ids when we can (best-effort, for outbound caching).
+            if sender is not None:
+                phone = await db.get_max_phone_by_user(sender)
+                if not phone:
+                    try:
+                        u = await client.get_user(sender)
+                        raw = getattr(u, "phone", None)
+                        if raw:
+                            phone = db.normalize_phone(str(raw))
+                    except Exception:
+                        phone = None
+                if phone:
+                    await db.set_max_peer(phone, chat_id, sender)
+            import replies
+            n = await replies.handle_incoming(int(chat_id), db.MAX, "Контакт MAX", text)
+            if n:
+                logger.info("MAX inbound chat=%s → %d owner(s)", chat_id, n)
+        except Exception:
+            logger.exception("MAX inbound handler error")
+
     logger.info("Starting MAX userbot (%s)...", settings.max_userbot_phone)
     try:
         await _client.start()   # connects, authorizes, then runs the receive loop
@@ -138,26 +168,30 @@ async def run() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sending
+# Resolving & sending
 # ---------------------------------------------------------------------------
 
-async def _resolve_chat_id(phone: str) -> int:
-    user = await _client.search_by_phone(phone)
-    their_id = _extract_my_id(user) if not hasattr(user, "id") else getattr(user, "id", None)
-    their_id = getattr(user, "id", None) or getattr(user, "user_id", None) or their_id
-    if their_id is None:
-        raise RuntimeError(f"MAX: не удалось определить id пользователя {phone}")
+async def resolve(phone: str) -> tuple[int, int]:
+    """Resolve a phone → (dialog chat_id, user_id). Cached in max_peer."""
+    if not is_ready():
+        raise RuntimeError("MAX userbot не готов (нет входа в аккаунт)")
     if _me_id is None:
         raise RuntimeError("MAX: неизвестен собственный id аккаунта")
-    return await _client.get_chat_id(_me_id, their_id)
+    user = await _client.search_by_phone(phone)
+    their_id = getattr(user, "id", None) or getattr(user, "user_id", None)
+    if their_id is None:
+        raise RuntimeError(f"MAX: пользователь с номером {phone} не найден")
+    chat_id = await _client.get_chat_id(_me_id, their_id)
+    await db.set_max_peer(phone, chat_id, their_id)
+    return chat_id, their_id
 
 
 async def send(target, text: str) -> None:
-    """Send a MAX message. ``target`` = phone string (+7…) or a chat_id int."""
+    """Send a MAX message. ``target`` = MAX dialog chat_id (int) or phone (+7…)."""
     if not is_ready():
         raise RuntimeError("MAX userbot не готов (нет входа в аккаунт)")
     if isinstance(target, str) and target.strip().startswith("+"):
-        chat_id = await _resolve_chat_id(target.strip())
+        chat_id, _ = await resolve(target.strip())
     else:
         chat_id = int(target)
     await _client.send_message(chat_id, text)
