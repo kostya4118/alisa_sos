@@ -297,7 +297,7 @@ async def resolve(phone: str) -> tuple[int, int]:
             raise RuntimeError(f"MAX: не удалось найти {phone}: {last_err}") from last_err
         raise RuntimeError(f"MAX: пользователь с номером {phone} не зарегистрирован в MAX")
 
-    chat_id = await _client.get_chat_id(_me_id, their_id)
+    chat_id = _client.get_chat_id(_me_id, their_id)  # sync — computed locally
     await db.set_max_peer(phone, chat_id, their_id)
     return chat_id, their_id
 
