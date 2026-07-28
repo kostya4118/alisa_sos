@@ -494,6 +494,24 @@ async def cmd_maxcode(message: Message) -> None:
                          else "Сейчас код не запрашивается (вход уже выполнен или не начат).")
 
 
+@router.message(Command("maxpassword"))
+async def cmd_maxpassword(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /maxpassword ВАШ_ПАРОЛЬ")
+        return
+    import max_user
+    ok = max_user.submit_password(parts[1].strip())
+    try:
+        await message.delete()  # remove the message with the password
+    except Exception:
+        pass
+    await message.answer("✅ Пароль 2FA принят, продолжаю вход в MAX." if ok
+                         else "Сейчас пароль не запрашивается.")
+
+
 @router.message(Command("maxstatus"))
 async def cmd_maxstatus(message: Message) -> None:
     if not _is_admin(message.from_user.id):

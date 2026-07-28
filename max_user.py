@@ -11,7 +11,9 @@ account may be banned — treat this as a best-effort SECONDARY channel, not a
 lifeline. Enabled only when ``MAX_USERBOT_PHONE`` is set.
 
 Login: on first start PyMax asks for an SMS code; we ask the admin for it in
-Telegram (``/maxcode 1234``). The session is saved under ``data/`` and reused.
+Telegram (``/maxcode 1234``). If the account has 2FA, the password comes from
+``MAX_USERBOT_PASSWORD`` or is requested via ``/maxpassword``. The session is
+saved under ``data/`` and reused.
 """
 
 import asyncio
@@ -27,9 +29,10 @@ _client = None            # pymax.Client
 _ready = asyncio.Event()
 _me_id: int | None = None
 
-# SMS-code handshake with the admin (via the Telegram bot)
+# SMS-code / 2FA-password handshakes with the admin (via the Telegram bot)
 _code_future: "asyncio.Future[str] | None" = None
 _code_phone: str = ""
+_password_future: "asyncio.Future[str] | None" = None
 
 
 def enabled() -> bool:
@@ -63,6 +66,38 @@ def submit_code(code: str) -> bool:
     """Feed the SMS code the admin sent. Returns True if it was awaited."""
     if _code_future is not None and not _code_future.done():
         _code_future.set_result(code)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# 2FA password provider — from env, or asks the admin in Telegram
+# ---------------------------------------------------------------------------
+
+class _BotPasswordProvider:
+    async def get_password(self, hint: str | None = None) -> str:
+        # Preferred: password from .env (no interaction).
+        if settings.max_userbot_password:
+            logger.info("MAX userbot: using 2FA password from env")
+            return settings.max_userbot_password
+        global _password_future
+        loop = asyncio.get_event_loop()
+        _password_future = loop.create_future()
+        logger.info("MAX userbot: 2FA password requested (hint=%r)", hint)
+        h = f"\nПодсказка: {hint}" if hint else ""
+        await _notify_admin(
+            "🔐 MAX-аккаунт требует пароль 2FA." + h + "\n"
+            "Пришлите его командой:\n/maxpassword ВАШ_ПАРОЛЬ\n"
+            "(после входа удалите сообщение с паролем)"
+        )
+        password = await _password_future
+        return password.strip()
+
+
+def submit_password(password: str) -> bool:
+    """Feed the 2FA password the admin sent. Returns True if it was awaited."""
+    if _password_future is not None and not _password_future.done():
+        _password_future.set_result(password)
         return True
     return False
 
@@ -114,6 +149,7 @@ async def run() -> None:
         session_name="userbot.db",
         work_dir=_work_dir(),
         sms_code_provider=_BotSmsCodeProvider(),
+        password_provider=_BotPasswordProvider(),
     )
 
     @_client.on_start()
