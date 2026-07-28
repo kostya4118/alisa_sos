@@ -72,6 +72,36 @@ async def notify_integrations(
     return fired
 
 
+async def _mirror_to_max(owner: db.Owner, contact: db.Contact, text: str) -> bool:
+    """Also deliver an SOS to a phone-linked contact via the MAX userbot.
+
+    For a non-MAX contact that has a phone, sends the same text to that person
+    in MAX (resolved by phone) so they get it on both messengers and can reply
+    wherever. Records the MAX dialog in ``sos_log`` so their reply routes back.
+    Best-effort: never raises. Returns True if the MAX copy was sent.
+    """
+    if contact.platform == db.MAX or not contact.phone:
+        return False
+    try:
+        import max_user
+    except Exception:
+        return False
+    if not (max_user.enabled() and max_user.is_ready()):
+        return False
+    try:
+        max_chat_id = await db.get_max_chat_id(contact.phone)
+        if max_chat_id is None:
+            max_chat_id, _ = await max_user.resolve(contact.phone)
+        await max_user.send(max_chat_id, text)
+        await db.record_sos_recipient(max_chat_id, db.MAX, owner.chat_id)
+        logger.info("SOS mirrored to MAX for %s (%s) owner %d",
+                    contact.name, contact.phone, owner.chat_id)
+        return True
+    except Exception:
+        logger.info("MAX mirror to %s failed", contact.phone, exc_info=True)
+        return False
+
+
 async def send_sos(
     owner: db.Owner,
     extra_message: str = "",
@@ -104,6 +134,7 @@ async def send_sos(
 
     sent = 0
     failed = 0
+    mirrored = 0
     for contact in targets:
         try:
             await messaging.send(contact.platform, contact.chat_id, text)
@@ -119,16 +150,19 @@ async def send_sos(
             await db.record_sos_recipient(contact.chat_id, contact.platform, owner.chat_id)
         except Exception:
             logger.exception("Failed to record SOS recipient %d", contact.chat_id)
+        # Dual delivery: also copy to MAX for phone-linked contacts (reply-anywhere).
+        if await _mirror_to_max(owner, contact, text):
+            mirrored += 1
 
     # Fire the owner's external integrations (fire-and-forget — never blocks SOS).
     await notify_integrations(owner, extra_message=extra_message,
                               recipients=sent, failed=failed, kind=kind)
 
+    summary = f"📊 SOS разослан: ✅ {sent} получили, ❌ {failed} ошибок"
+    if mirrored:
+        summary += f"\n📲 продублировано в MAX: {mirrored}"
     try:
-        await messaging.send(
-            owner.platform, owner.chat_id,
-            f"📊 SOS разослан: ✅ {sent} получили, ❌ {failed} ошибок",
-        )
+        await messaging.send(owner.platform, owner.chat_id, summary)
     except Exception:
         logger.exception("Failed to send SOS summary to owner %d", owner.chat_id)
     return sent, failed

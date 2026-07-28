@@ -182,7 +182,8 @@ def _attach_handlers(client) -> None:
                 if phone:
                     await db.set_max_peer(phone, chat_id, sender)
             import replies
-            n = await replies.handle_incoming(int(chat_id), db.MAX, "Контакт MAX", text)
+            n = await replies.handle_incoming(int(chat_id), db.MAX, "Контакт MAX",
+                                              text, phone=phone)
             if n:
                 logger.info("MAX inbound chat=%s → %d owner(s)", chat_id, n)
         except Exception:

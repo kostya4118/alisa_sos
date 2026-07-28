@@ -345,6 +345,24 @@ async def get_owners_for_contact(contact_id: int, platform: str = TELEGRAM) -> l
     return [_row_to_owner(row) for row in rows]
 
 
+async def get_contacts_by_phone(phone: str) -> list[dict]:
+    """Contacts across all owners that carry this phone number (any platform).
+
+    Used to route a MAX reply back when the subscriber was reached by a
+    phone-linked contact (dual Telegram+MAX delivery) rather than a native
+    MAX contact. Returns rows with ``owner_id``, ``name``, ``platform``.
+    """
+    if not phone:
+        return []
+    async with _conn_or_error().execute(
+        "SELECT owner_id, name, platform, chat_id FROM contacts "
+        "WHERE phone = ? AND phone <> ''",
+        (phone,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Replies
 # ---------------------------------------------------------------------------
