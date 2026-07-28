@@ -40,14 +40,20 @@ def get_max_bot():
     return _max_bot
 
 
-async def send(platform: str, chat_id: int, text: str) -> None:
+async def send(platform: str, chat_id: int, text: str, *, phone: str = "") -> None:
     """Send a plain-text message to a recipient on the given platform.
 
+    For MAX, prefers the PyMax userbot (addressing by ``phone``) when it is
+    configured; otherwise falls back to the official MAX bot (by ``chat_id``).
     Raises on delivery failure so callers can count successes/failures.
     """
     if platform == db.MAX:
+        import max_user
+        if max_user.enabled():
+            await max_user.send(phone or chat_id, text)
+            return
         if _max_bot is None:
-            raise RuntimeError("MAX bot is not configured")
+            raise RuntimeError("MAX is not configured")
         await _max_bot.send_message(chat_id=chat_id, text=text)
     else:
         if _tg_bot is None:

@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     db_path: str = "sos.db"
     admin_chat_id: int | None = None
     max_bot_token: str | None = None
+    max_userbot_phone: str | None = None    # service MAX account (PyMax userbot)
     backup_interval_hours: int = 0          # 0 = auto-backup disabled
     backup_passphrase: str | None = None    # if set, backups are encrypted
     # SMTP — enables the e-mail "Телефон" bridge (iPhone email automation)

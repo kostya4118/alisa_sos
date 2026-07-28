@@ -83,6 +83,13 @@ async def main() -> None:
     ]
     if max_bot_module is not None:
         tasks.append(loop.create_task(max_bot_module.run_polling()))
+    if settings.max_userbot_phone:
+        try:
+            import max_user
+            tasks.append(loop.create_task(max_user.run()))
+            logger.info("MAX userbot enabled (%s)", settings.max_userbot_phone)
+        except Exception:
+            logger.exception("Failed to start MAX userbot — continuing without it")
     if settings.backup_interval_hours and settings.admin_chat_id:
         tasks.append(loop.create_task(bot_module.auto_backup_loop(telegram_bot)))
         logger.info("Auto-backup enabled: every %d h", settings.backup_interval_hours)

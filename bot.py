@@ -477,6 +477,62 @@ async def callback_admin_cancel(callback: CallbackQuery) -> None:
 
 
 # ---------------------------------------------------------------------------
+# MAX userbot (PyMax) — admin login + adding MAX subscribers by phone
+# ---------------------------------------------------------------------------
+
+@router.message(Command("maxcode"))
+async def cmd_maxcode(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer("Использование: /maxcode 1234")
+        return
+    import max_user
+    ok = max_user.submit_code(parts[1].strip())
+    await message.answer("✅ Код принят, продолжаю вход в MAX." if ok
+                         else "Сейчас код не запрашивается (вход уже выполнен или не начат).")
+
+
+@router.message(Command("maxstatus"))
+async def cmd_maxstatus(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    import max_user
+    if not max_user.enabled():
+        await message.answer("MAX-userbot выключен (не задан MAX_USERBOT_PHONE).")
+        return
+    await message.answer("MAX-userbot: " + ("✅ подключён" if max_user.is_ready()
+                         else "⏳ не подключён — жду SMS-код (/maxcode) или переподключение."))
+
+
+@router.message(Command("addmax"))
+async def cmd_addmax(message: Message) -> None:
+    owner = await _get_active_owner(message.from_user.id, message)
+    if not owner:
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("Использование: /addmax Имя +79991234567")
+        return
+    phone = db.normalize_phone(parts[-1])
+    name = " ".join(parts[1:-1]).strip()
+    if not phone or not name:
+        await message.answer("Пример: /addmax Мама +79991234567")
+        return
+    cid = int(phone.lstrip("+"))  # phone digits as a synthetic chat_id (unique per number)
+    added = await db.add_contact(owner.chat_id, cid, name, db.MAX)
+    if not added:
+        await message.answer("Такой MAX-контакт уже добавлен.")
+        return
+    await db.set_contact_phone(owner.chat_id, cid, db.MAX, phone)
+    await message.answer(
+        f"✅ MAX-контакт добавлен: {name} ({phone}).\n"
+        "SOS и сообщения будут уходить ему в MAX через сервисный аккаунт."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Backup / restore (admin only)
 # ---------------------------------------------------------------------------
 

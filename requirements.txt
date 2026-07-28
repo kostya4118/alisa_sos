@@ -2,8 +2,9 @@ fastapi==0.115.5
 uvicorn[standard]==0.32.1
 aiogram==3.29.0
 pydantic-settings==2.6.1
-aiofiles==24.1.0
+aiofiles==25.1.0
 httpx==0.27.2
-aiosqlite==0.20.0
+aiosqlite==0.22.1
 maxapi==1.2.0
+maxapi-python==2.3.1
 cryptography>=42.0
