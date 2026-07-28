@@ -156,6 +156,7 @@ def _attach_handlers(client) -> None:
         _me_id = _extract_my_id(me)
         if _me_id is None:
             logger.error("MAX userbot: could not read own user id from profile %r", me)
+        await _on_account_check(me)
         _ready.set()
         await _notify_admin("✅ MAX-аккаунт подключён. Дозвон/сообщения в MAX активны.")
 
@@ -195,6 +196,49 @@ def _is_transient_auth_error(err: Exception) -> bool:
     """Expired SMS code / attempt-limit / code errors — worth requesting anew."""
     msg = str(err).lower()
     return any(k in msg for k in ("устарел", "attempt.limit", "code", "sms", "устар"))
+
+
+def _extract_my_phone(me) -> str:
+    """Digits of the logged-in account's own phone (from Profile.contact)."""
+    contact = getattr(me, "contact", None) or me
+    raw = getattr(contact, "phone", None)
+    return "".join(ch for ch in str(raw or "") if ch.isdigit())
+
+
+async def _on_account_check(me) -> None:
+    """Guard against a leftover session from a previous service number.
+
+    - If the logged-in account changed, drop cached MAX dialogs (their ids are
+      derived from the account's own id and would be wrong for the new one).
+    - If the logged-in phone differs from ``MAX_USERBOT_PHONE``, the saved
+      session still belongs to the OLD number — warn loudly (the operator must
+      delete ``data/max_session`` to switch).
+    """
+    try:
+        # Account-change → invalidate the dialog cache.
+        if _me_id is not None:
+            prev = await db.get_meta("max_me_id")
+            cur = str(_me_id)
+            if prev != cur:
+                n = await db.clear_max_peers()
+                if prev:
+                    logger.warning("MAX account changed (%s→%s); cleared %d cached peers",
+                                   prev, cur, n)
+                await db.set_meta("max_me_id", cur)
+
+        # Phone-mismatch → stale session for a different number.
+        want = "".join(ch for ch in str(settings.max_userbot_phone or "") if ch.isdigit())
+        got = _extract_my_phone(me)
+        if want and got and want != got:
+            logger.warning("MAX session is for +%s but MAX_USERBOT_PHONE=+%s — "
+                           "delete data/max_session to switch numbers", got, want)
+            await _notify_admin(
+                f"⚠️ MAX вошёл под старым номером +{got}, а в настройках +{want}.\n"
+                "Чтобы сменить сервисный номер: останови бот, удали папку "
+                "data/max_session и запусти снова — тогда попросит SMS на новый номер."
+            )
+    except Exception:
+        logger.exception("MAX account check failed")
 
 
 async def run() -> None:

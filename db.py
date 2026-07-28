@@ -109,6 +109,10 @@ async def init(path: str) -> None:
             user_id  INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_max_peer_user ON max_peer(user_id);
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
     """)
     await _conn.commit()
     # Idempotent column additions for installations created before these columns existed.
@@ -437,6 +441,33 @@ async def set_max_peer(phone: str, chat_id: int | None = None, user_id: int | No
         "chat_id = COALESCE(excluded.chat_id, max_peer.chat_id), "
         "user_id = COALESCE(excluded.user_id, max_peer.user_id)",
         (phone, chat_id, user_id),
+    )
+    await conn.commit()
+
+
+async def clear_max_peers() -> int:
+    """Drop all cached MAX dialogs (e.g. after the service account changes —
+    dialog ids are computed from the account's own id and become invalid)."""
+    conn = _conn_or_error()
+    cur = await conn.execute("DELETE FROM max_peer")
+    await conn.commit()
+    return cur.rowcount
+
+
+async def get_meta(key: str) -> str | None:
+    async with _conn_or_error().execute(
+        "SELECT value FROM meta WHERE key = ?", (key,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row["value"] if row else None
+
+
+async def set_meta(key: str, value: str) -> None:
+    conn = _conn_or_error()
+    await conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
     )
     await conn.commit()
 
