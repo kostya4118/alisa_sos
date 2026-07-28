@@ -80,13 +80,23 @@ async def _mirror_to_max(owner: db.Owner, contact: db.Contact, text: str) -> boo
     wherever. Records the MAX dialog in ``sos_log`` so their reply routes back.
     Best-effort: never raises. Returns True if the MAX copy was sent.
     """
-    if contact.platform == db.MAX or not contact.phone:
+    if contact.platform == db.MAX:
+        return False  # already a native MAX contact — nothing to mirror
+    if not contact.phone:
+        logger.info("MAX mirror skipped for %s: no phone set", contact.name)
         return False
     try:
         import max_user
     except Exception:
+        logger.info("MAX mirror skipped: max_user import failed", exc_info=True)
         return False
-    if not (max_user.enabled() and max_user.is_ready()):
+    if not max_user.enabled():
+        logger.info("MAX mirror skipped for %s: userbot disabled (no MAX_USERBOT_PHONE)",
+                    contact.name)
+        return False
+    if not max_user.is_ready():
+        logger.warning("MAX mirror skipped for %s (%s): userbot NOT connected — "
+                       "log in via /maxcode", contact.name, contact.phone)
         return False
     try:
         max_chat_id = await db.get_max_chat_id(contact.phone)
@@ -94,11 +104,12 @@ async def _mirror_to_max(owner: db.Owner, contact: db.Contact, text: str) -> boo
             max_chat_id, _ = await max_user.resolve(contact.phone)
         await max_user.send(max_chat_id, text)
         await db.record_sos_recipient(max_chat_id, db.MAX, owner.chat_id)
-        logger.info("SOS mirrored to MAX for %s (%s) owner %d",
-                    contact.name, contact.phone, owner.chat_id)
+        logger.info("SOS mirrored to MAX for %s (%s) chat=%s owner %d",
+                    contact.name, contact.phone, max_chat_id, owner.chat_id)
         return True
     except Exception:
-        logger.info("MAX mirror to %s failed", contact.phone, exc_info=True)
+        logger.warning("MAX mirror to %s (%s) FAILED", contact.name, contact.phone,
+                       exc_info=True)
         return False
 
 
