@@ -158,7 +158,9 @@ def _attach_handlers(client) -> None:
             logger.error("MAX userbot: could not read own user id from profile %r", me)
         await _on_account_check(me)
         _ready.set()
-        await _notify_admin("✅ MAX-аккаунт подключён. Дозвон/сообщения в MAX активны.")
+        # No "connected" ping to the admin — notify only when action is needed
+        # (SMS code, 2FA password, wrong number, errors). Success is silent.
+        logger.info("MAX userbot ready (me_id=%s)", _me_id)
 
     # Inbound: a MAX user wrote to our service account → treat as a subscriber
     # reply and forward it to the owner(s), matching by the dialog chat_id.
