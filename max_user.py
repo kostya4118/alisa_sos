@@ -132,6 +132,30 @@ def _work_dir() -> str:
     return d
 
 
+def _clear_session() -> bool:
+    """Delete the saved MAX session (+ its WAL/SHM). Returns True if anything
+    was removed. Used when MAX invalidates the token (FAIL_LOGIN_TOKEN) so the
+    next start falls back to a fresh SMS login instead of looping on a dead
+    token."""
+    base = os.path.join(_work_dir(), "userbot.db")
+    removed = False
+    for path in (base, base + "-wal", base + "-shm", base + "-journal"):
+        try:
+            os.remove(path)
+            removed = True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.exception("failed to remove MAX session file %s", path)
+    return removed
+
+
+def _is_stale_session_error(err: Exception) -> bool:
+    """MAX rejected the saved session token — need a fresh SMS login."""
+    msg = str(err).lower()
+    return "fail_login_token" in msg or "login.token" in msg
+
+
 def _extract_my_id(me) -> int | None:
     """Own user id from the Profile — tolerant to PyMax's shape."""
     for path in ("id", "user_id"):
@@ -276,6 +300,22 @@ async def run() -> None:
             global _last_fail_notice
             _ready.clear()
             logger.exception("MAX userbot login/run failed")
+
+            # Stale saved session (MAX invalidated the token): wipe it so the
+            # next attempt does a fresh SMS login instead of looping forever.
+            if _is_stale_session_error(err) and _clear_session():
+                logger.warning("MAX session token rejected — cleared session, "
+                               "will re-login via SMS")
+                if _last_fail_notice != "stale":
+                    _last_fail_notice = "stale"
+                    await _notify_admin(
+                        "⚠️ MAX-аккаунт разлогинен (сессия устарела). "
+                        "Вхожу заново — как придёт SMS, пришлите /maxcode 1234."
+                    )
+                await asyncio.sleep(5)
+                backoff = 60
+                continue
+
             if _is_transient_auth_error(err):
                 wait = max(backoff, 90)
                 kind = "auth"
