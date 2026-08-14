@@ -38,6 +38,9 @@ _me_id: int | None = None
 _code_future: "asyncio.Future[str] | None" = None
 _code_phone: str = ""
 _password_future: "asyncio.Future[str] | None" = None
+# Last failure reason we alerted the admin about — so we notify once per new
+# problem instead of on every retry (was spamming every 10 min all night).
+_last_fail_notice: str | None = None
 
 
 def enabled() -> bool:
@@ -156,8 +159,10 @@ def _attach_handlers(client) -> None:
         _me_id = _extract_my_id(me)
         if _me_id is None:
             logger.error("MAX userbot: could not read own user id from profile %r", me)
+        global _last_fail_notice
         await _on_account_check(me)
         _ready.set()
+        _last_fail_notice = None  # recovered — allow a fresh alert on next failure
         # No "connected" ping to the admin — notify only when action is needed
         # (SMS code, 2FA password, wrong number, errors). Success is silent.
         logger.info("MAX userbot ready (me_id=%s)", _me_id)
@@ -268,18 +273,24 @@ async def run() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as err:
+            global _last_fail_notice
             _ready.clear()
             logger.exception("MAX userbot login/run failed")
             if _is_transient_auth_error(err):
                 wait = max(backoff, 90)
-                reason = "код устарел или превышен лимит попыток"
+                kind = "auth"
+                msg = ("⚠️ MAX-аккаунт: код устарел или превышен лимит. "
+                       "Как придёт SMS — пришлите /maxcode 1234.")
             else:
                 wait = backoff
-                reason = "ошибка входа/соединения"
-            await _notify_admin(
-                f"⚠️ MAX-аккаунт: {reason}. Повторю попытку входа через "
-                f"{wait} сек — держите наготове новый SMS-код (/maxcode 1234)."
-            )
+                kind = "conn"
+                msg = ("⚠️ MAX-аккаунт: проблема с подключением, переподключаюсь "
+                       "в фоне. Действий не требуется — сообщу, только если "
+                       "понадобится SMS-код.")
+            # Notify once per new problem, not on every retry (anti-spam).
+            if kind != _last_fail_notice:
+                _last_fail_notice = kind
+                await _notify_admin(msg)
             await asyncio.sleep(wait)
             backoff = min(backoff * 2, 600)
             continue
