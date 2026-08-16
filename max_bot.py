@@ -21,6 +21,7 @@ import db
 import guide
 import messaging
 import notifier
+import webhook_out
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,8 @@ def _settings_kb():
     kb.row(CallbackButton(text="📝 Изменить текст SOS", payload="cfg_message"))
     kb.row(CallbackButton(text="🕐 Изменить часовой пояс", payload="cfg_tz"))
     kb.row(CallbackButton(text="⏰ Авточек", payload="cfg_checkin"))
+    kb.row(CallbackButton(text="🔗 Webhook при SOS", payload="cfg_webhook"))
+    kb.row(CallbackButton(text="📧 E-mail для дозвона", payload="cfg_email"))
     kb.row(CallbackButton(text="🗑 Удалить аккаунт", payload="cfg_delete"))
     kb.row(CallbackButton(text="⬅️ Меню", payload="menu_home"))
     return kb.as_markup()
@@ -230,7 +233,7 @@ async def _register(chat_id: int, name: str) -> None:
 
 
 async def _subscribe(chat_id: int, name: str, token: str) -> None:
-    owner = await db.get_owner_by_token(token)
+    owner = await db.get_owner_by_subscribe_code(token)
     if owner is None:
         await _send(chat_id, "Ссылка недействительна. Попросите новую ссылку.")
         return
@@ -309,25 +312,28 @@ async def _menu_action(chat_id: int, payload: str) -> None:
     if payload == "menu_contacts":
         contacts = await db.get_contacts(owner.chat_id)
         if not contacts:
-            link = await build_subscribe_link(owner.webhook_token)
+            link = await build_subscribe_link(owner.subscribe_code)
             await _send(chat_id, f"Список контактов пуст.\n\nСсылка для друзей:\n{link or '—'}")
             return
         lines = [f"👥 Подписчики ({len(contacts)}):\n"]
         kb = InlineKeyboardBuilder()
         for i, c in enumerate(contacts, 1):
             tag = "🅼" if c.platform == db.MAX else "📱"
-            lines.append(f"{i}. {tag} {c.name}")
-            kb.row(CallbackButton(text=f"✏️ {tag} {c.name}",
+            ph = f" 📞 {c.phone}" if c.phone else ""
+            lines.append(f"{i}. {tag} {c.name}{ph}")
+            kb.row(CallbackButton(text=f"✏️ {c.name}",
                                   payload=f"rename:{c.platform}:{c.chat_id}"),
+                   CallbackButton(text="📞",
+                                  payload=f"phone:{c.platform}:{c.chat_id}"),
                    CallbackButton(text="❌",
                                   payload=f"remove:{c.platform}:{c.chat_id}"))
         kb.row(CallbackButton(text="⬅️ Меню", payload="menu_home"))
-        lines.append("\n✏️ — переименовать (удобно для Алисы), ❌ — удалить")
+        lines.append("\n✏️ — переименовать, 📞 — телефон, ❌ — удалить")
         await _send(chat_id, "\n".join(lines), kb.as_markup())
 
     elif payload == "menu_test":
         await _send(chat_id, "Отправляю тестовый SOS...")
-        sent, failed = await notifier.send_sos(owner, extra_message="[ТЕСТ — не паникуйте!]")
+        sent, failed = await notifier.send_sos(owner, extra_message="[ТЕСТ — не паникуйте!]", kind="test")
         await _send(chat_id, f"✅ Тест завершён: {sent} доставлено, {failed} ошибок", _menu_kb())
 
     elif payload == "menu_sos":
@@ -346,7 +352,7 @@ async def _menu_action(chat_id: int, payload: str) -> None:
         await db.mark_replies_read(owner.chat_id)
 
     elif payload == "menu_link":
-        link = await build_subscribe_link(owner.webhook_token)
+        link = await build_subscribe_link(owner.subscribe_code)
         await _send(chat_id,
                     f"Ссылка для подписки (MAX):\n\n{link or '—'}\n\n"
                     "Отправьте её друзьям в MAX.", _menu_kb())
@@ -354,7 +360,7 @@ async def _menu_action(chat_id: int, payload: str) -> None:
     elif payload == "menu_status":
         contacts = await db.get_contacts(owner.chat_id)
         webhook_url = f"{settings.base_url}/alice/{owner.webhook_token}"
-        link = await build_subscribe_link(owner.webhook_token)
+        link = await build_subscribe_link(owner.subscribe_code)
         await _send(
             chat_id,
             f"📊 Ваши настройки\n\n"
@@ -392,6 +398,32 @@ async def _settings_action(chat_id: int, payload: str) -> None:
     elif payload == "cfg_tz":
         _pending_state[chat_id] = "set_tz"
         await _send(chat_id, "🕐 Введите часовой пояс — число от −12 до +14 (Москва = 3):", _cancel_kb())
+    elif payload == "cfg_webhook":
+        _pending_state[chat_id] = "set_webhook"
+        cur = owner.sos_webhook_url or "не задан"
+        await _send(
+            chat_id,
+            "🔗 Webhook при SOS.\n\n"
+            "При каждом SOS бот отправит POST с JSON на этот адрес (Pushcut, IFTTT, "
+            "n8n, свой скрипт).\n\n"
+            f"Сейчас: {cur}\n\n"
+            "Пришлите URL (https://...) или «-», чтобы отключить.",
+            _cancel_kb(),
+        )
+    elif payload == "cfg_email":
+        import email_out
+        _pending_state[chat_id] = "set_email"
+        cur = owner.sos_email or "не задан"
+        note = "" if email_out.enabled() else "\n\n⚠️ На сервере не настроен SMTP — письма пока не будут отправляться."
+        await _send(
+            chat_id,
+            "📧 E-mail для дозвона.\n\n"
+            "При выборе «Телефон» у Алисы бот шлёт письмо на этот адрес; на iPhone "
+            "автоматизация «E-mail → Выполнять сразу» звонит и пишет контакту.\n\n"
+            f"Сейчас: {cur}{note}\n\n"
+            "Пришлите адрес или «-», чтобы отключить.",
+            _cancel_kb(),
+        )
     elif payload == "cfg_cancel":
         _pending_state.pop(chat_id, None)
         await _send(chat_id, "Отменено.", _menu_kb())
@@ -463,6 +495,21 @@ async def _confirm_action(chat_id: int, payload: str) -> None:
         _pending_state[chat_id] = f"rename:{platform}:{cid_str}"
         await _send(chat_id, f"✏️ Введите новое имя для «{cur}» (как Алисе удобнее произносить):", _cancel_kb())
 
+    elif payload.startswith("phone:"):
+        owner = await _active_owner(chat_id)
+        if not owner:
+            return
+        _, platform, cid_str = payload.split(":")
+        contacts = await db.get_contacts(owner.chat_id)
+        c = next((x for x in contacts if x.chat_id == int(cid_str) and x.platform == platform), None)
+        cur = (c.phone if c and c.phone else "не задан")
+        name = c.name if c else cid_str
+        _pending_state[chat_id] = f"setphone:{platform}:{cid_str}"
+        await _send(chat_id,
+                    f"📞 Телефон для «{name}» (для дозвона через «Телефон»).\n\n"
+                    f"Сейчас: {cur}\n\nПришлите номер (+79991234567) или «-», чтобы удалить.",
+                    _cancel_kb())
+
     elif payload == "checkin_ok":
         await checkin_module.confirm(chat_id)
         await _send(chat_id, "✅ Отметка принята. Всё хорошо!")
@@ -483,6 +530,24 @@ async def _handle_text(chat_id: int, name: str, text: str) -> None:
 
     state = _pending_state.pop(chat_id, None)
 
+    if state and state.startswith("setphone:"):
+        owner = await _active_owner(chat_id)
+        if not owner:
+            return
+        _, platform, cid_str = state.split(":")
+        if text in ("-", "—", "нет", "off", "выкл"):
+            await db.set_contact_phone(owner.chat_id, int(cid_str), platform, "")
+            await _send(chat_id, "📞 Телефон удалён.", _menu_kb())
+            return
+        phone = db.normalize_phone(text)
+        if not phone:
+            _pending_state[chat_id] = state
+            await _send(chat_id, "Некорректный номер. Пример: +79991234567. Пришлите ещё раз или «-».", _cancel_kb())
+            return
+        await db.set_contact_phone(owner.chat_id, int(cid_str), platform, phone)
+        await _send(chat_id, f"✅ Телефон сохранён: {phone}", _menu_kb())
+        return
+
     if state and state.startswith("rename:"):
         owner = await _active_owner(chat_id)
         if not owner:
@@ -493,6 +558,36 @@ async def _handle_text(chat_id: int, name: str, text: str) -> None:
             await _send(chat_id, f"✅ Контакт переименован в «{text}»", _menu_kb())
         else:
             await _send(chat_id, "Контакт не найден (возможно, удалён).", _menu_kb())
+        return
+
+    if state == "set_webhook":
+        if not await _active_owner(chat_id):
+            return
+        if text in ("-", "—", "нет", "off", "выкл"):
+            await db.update_owner(chat_id, sos_webhook_url="")
+            await _send(chat_id, "🔗 Webhook при SOS отключён.", _menu_kb())
+            return
+        if not webhook_out.is_allowed_url(text):
+            _pending_state[chat_id] = "set_webhook"
+            await _send(chat_id, "Некорректный URL. Нужен публичный https-адрес. Пришлите ещё раз или «-».", _cancel_kb())
+            return
+        await db.update_owner(chat_id, sos_webhook_url=text)
+        await _send(chat_id, f"✅ Webhook при SOS сохранён:\n{text}", _menu_kb())
+        return
+
+    if state == "set_email":
+        if not await _active_owner(chat_id):
+            return
+        if text in ("-", "—", "нет", "off", "выкл"):
+            await db.update_owner(chat_id, sos_email="")
+            await _send(chat_id, "📧 E-mail для дозвона отключён.", _menu_kb())
+            return
+        if "@" not in text or "." not in text.split("@")[-1] or " " in text:
+            _pending_state[chat_id] = "set_email"
+            await _send(chat_id, "Некорректный адрес. Пришлите e-mail ещё раз или «-».", _cancel_kb())
+            return
+        await db.update_owner(chat_id, sos_email=text)
+        await _send(chat_id, f"✅ E-mail для дозвона сохранён:\n{text}", _menu_kb())
         return
 
     if state == "set_name":

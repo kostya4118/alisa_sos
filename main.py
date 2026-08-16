@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 def create_app(telegram_bot: Bot, max_bot=None) -> FastAPI:
-    app = FastAPI(title="Alisa SOS", docs_url=None, redoc_url=None)
+    # docs/redoc/openapi all disabled: this API is a machine webhook, not a
+    # browsable API — no schema should leak the app version or endpoints.
+    app = FastAPI(title="Alisa SOS", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.bot = telegram_bot
     app.state.max_bot = max_bot
     app.include_router(alice.router)
@@ -83,6 +85,13 @@ async def main() -> None:
     ]
     if max_bot_module is not None:
         tasks.append(loop.create_task(max_bot_module.run_polling()))
+    if settings.max_userbot_phone:
+        try:
+            import max_user
+            tasks.append(loop.create_task(max_user.run()))
+            logger.info("MAX userbot enabled (%s)", settings.max_userbot_phone)
+        except Exception:
+            logger.exception("Failed to start MAX userbot — continuing without it")
     if settings.backup_interval_hours and settings.admin_chat_id:
         tasks.append(loop.create_task(bot_module.auto_backup_loop(telegram_bot)))
         logger.info("Auto-backup enabled: every %d h", settings.backup_interval_hours)

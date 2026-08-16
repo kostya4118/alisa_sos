@@ -1,5 +1,5 @@
+import secrets
 import time
-import uuid
 from dataclasses import dataclass, field
 
 import aiosqlite
@@ -18,6 +18,16 @@ def set_restoring(value: bool) -> None:
     _restoring = value
 
 
+def normalize_phone(raw: str) -> str | None:
+    """Clean a phone number to '+<digits>' / '<digits>'. None if too short."""
+    raw = (raw or "").strip()
+    plus = raw.lstrip().startswith("+")
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) < 5:
+        return None
+    return ("+" if plus else "") + digits
+
+
 @dataclass
 class Owner:
     chat_id: int
@@ -27,6 +37,9 @@ class Owner:
     webhook_token: str
     status: str = field(default="active")      # "pending" | "active"
     platform: str = field(default=TELEGRAM)    # "telegram" | "max"
+    sos_webhook_url: str = field(default="")   # optional outbound webhook on SOS
+    sos_email: str = field(default="")         # optional e-mail bridge for "Телефон"
+    subscribe_code: str = field(default="")    # public invite code (NOT the Alice secret)
 
 
 @dataclass
@@ -34,6 +47,7 @@ class Contact:
     chat_id: int
     name: str
     platform: str = TELEGRAM
+    phone: str = ""
 
     def first_name(self) -> str:
         return self.name.split()[0] if self.name else self.name
@@ -52,7 +66,9 @@ async def init(path: str) -> None:
             tz_offset     INTEGER NOT NULL DEFAULT 0,
             webhook_token TEXT    NOT NULL UNIQUE,
             status        TEXT    NOT NULL DEFAULT 'active',
-            platform      TEXT    NOT NULL DEFAULT 'telegram'
+            platform      TEXT    NOT NULL DEFAULT 'telegram',
+            sos_webhook_url TEXT  NOT NULL DEFAULT '',
+            subscribe_code  TEXT  NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS contacts (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +76,7 @@ async def init(path: str) -> None:
             chat_id   INTEGER NOT NULL,
             name      TEXT    NOT NULL,
             platform  TEXT    NOT NULL DEFAULT 'telegram',
+            phone     TEXT    NOT NULL DEFAULT '',
             UNIQUE(owner_id, chat_id, platform)
         );
         CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_id);
@@ -88,6 +105,16 @@ async def init(path: str) -> None:
             sent_at    INTEGER NOT NULL,
             PRIMARY KEY (contact_id, platform, owner_id)
         );
+        CREATE TABLE IF NOT EXISTS max_peer (
+            phone    TEXT    PRIMARY KEY,
+            chat_id  INTEGER,
+            user_id  INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_max_peer_user ON max_peer(user_id);
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
     """)
     await _conn.commit()
     # Idempotent column additions for installations created before these columns existed.
@@ -95,7 +122,11 @@ async def init(path: str) -> None:
         ("owners", "status", "ALTER TABLE owners ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
         ("owners", "platform", "ALTER TABLE owners ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
         ("contacts", "platform", "ALTER TABLE contacts ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
+        ("contacts", "phone", "ALTER TABLE contacts ADD COLUMN phone TEXT NOT NULL DEFAULT ''"),
         ("replies", "platform", "ALTER TABLE replies ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
+        ("owners", "sos_webhook_url", "ALTER TABLE owners ADD COLUMN sos_webhook_url TEXT NOT NULL DEFAULT ''"),
+        ("owners", "sos_email", "ALTER TABLE owners ADD COLUMN sos_email TEXT NOT NULL DEFAULT ''"),
+        ("owners", "subscribe_code", "ALTER TABLE owners ADD COLUMN subscribe_code TEXT NOT NULL DEFAULT ''"),
     ):
         try:
             await _conn.execute(ddl)
@@ -109,6 +140,20 @@ async def init(path: str) -> None:
         "CREATE INDEX IF NOT EXISTS idx_contacts_chat ON contacts(chat_id, platform)"
     )
     await _conn.commit()
+
+    # Backfill a public subscribe_code for owners created before this column
+    # existed (their invite links used to reuse the secret webhook_token).
+    async with _conn.execute(
+        "SELECT chat_id FROM owners WHERE subscribe_code = '' OR subscribe_code IS NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    for r in rows:
+        await _conn.execute(
+            "UPDATE owners SET subscribe_code = ? WHERE chat_id = ?",
+            (secrets.token_urlsafe(16), r["chat_id"]),
+        )
+    if rows:
+        await _conn.commit()
 
 
 async def close() -> None:
@@ -146,6 +191,9 @@ def _row_to_owner(row) -> Owner:
         webhook_token=d["webhook_token"],
         status=d.get("status", "active"),
         platform=d.get("platform", TELEGRAM),
+        sos_webhook_url=d.get("sos_webhook_url", "") or "",
+        sos_email=d.get("sos_email", "") or "",
+        subscribe_code=d.get("subscribe_code", "") or "",
     )
 
 
@@ -180,17 +228,49 @@ async def get_all_owners() -> list[Owner]:
 
 async def create_owner(chat_id: int, name: str, status: str = "active",
                        platform: str = TELEGRAM) -> Owner:
-    token = str(uuid.uuid4())
+    token = secrets.token_urlsafe(32)  # 256-bit Alice webhook secret (never shared)
+    sub = secrets.token_urlsafe(16)    # public invite code (safe to share in links)
     conn = _conn_or_error()
     await conn.execute(
-        "INSERT INTO owners(chat_id, name, webhook_token, status, platform) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (chat_id, name, token, status, platform),
+        "INSERT INTO owners(chat_id, name, webhook_token, subscribe_code, status, platform) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, name, token, sub, status, platform),
     )
     await conn.commit()
     return Owner(chat_id=chat_id, name=name,
                  sos_message="🆘 ТРЕВОГА! Мне нужна помощь!",
-                 tz_offset=0, webhook_token=token, status=status, platform=platform)
+                 tz_offset=0, webhook_token=token, status=status, platform=platform,
+                 subscribe_code=sub)
+
+
+async def get_owner_by_subscribe_code(code: str) -> Owner | None:
+    """Resolve an invite deep-link code to its owner (public code, not the
+    Alice secret). Falls back to webhook_token so links shared before the
+    split still work."""
+    if not code:
+        return None
+    conn = _conn_or_error()
+    async with conn.execute(
+        "SELECT * FROM owners WHERE subscribe_code = ?", (code,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row:
+        return _row_to_owner(row)
+    # Backward-compat: old invite links carried the webhook_token itself.
+    return await get_owner_by_token(code)
+
+
+async def rotate_webhook_token(chat_id: int) -> str | None:
+    """Issue a fresh Alice webhook secret (invalidates the old URL and any
+    old invite link that leaked it). Returns the new token, or None if the
+    owner doesn't exist."""
+    conn = _conn_or_error()
+    token = secrets.token_urlsafe(32)
+    cur = await conn.execute(
+        "UPDATE owners SET webhook_token = ? WHERE chat_id = ?", (token, chat_id)
+    )
+    await conn.commit()
+    return token if cur.rowcount > 0 else None
 
 
 async def set_owner_status(chat_id: int, status: str) -> None:
@@ -200,7 +280,7 @@ async def set_owner_status(chat_id: int, status: str) -> None:
 
 
 async def update_owner(chat_id: int, **fields) -> None:
-    allowed = {"name", "sos_message", "tz_offset"}
+    allowed = {"name", "sos_message", "tz_offset", "sos_webhook_url", "sos_email"}
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return
@@ -225,11 +305,12 @@ async def delete_owner(chat_id: int) -> None:
 
 async def get_contacts(owner_id: int) -> list[Contact]:
     async with _conn_or_error().execute(
-        "SELECT chat_id, name, platform FROM contacts WHERE owner_id = ? ORDER BY id",
+        "SELECT chat_id, name, platform, phone FROM contacts WHERE owner_id = ? ORDER BY id",
         (owner_id,),
     ) as cur:
         rows = await cur.fetchall()
-    return [Contact(chat_id=r["chat_id"], name=r["name"], platform=r["platform"]) for r in rows]
+    return [Contact(chat_id=r["chat_id"], name=r["name"], platform=r["platform"],
+                    phone=r["phone"] if "phone" in r.keys() else "") for r in rows]
 
 
 async def add_contact(owner_id: int, chat_id: int, name: str,
@@ -276,6 +357,17 @@ async def rename_contact(owner_id: int, chat_id: int, platform: str, new_name: s
     return cur.rowcount > 0
 
 
+async def set_contact_phone(owner_id: int, chat_id: int, platform: str, phone: str) -> bool:
+    """Set/clear a contact's phone number. Returns True if it existed."""
+    conn = _conn_or_error()
+    cur = await conn.execute(
+        "UPDATE contacts SET phone = ? WHERE owner_id = ? AND chat_id = ? AND platform = ?",
+        (phone, owner_id, chat_id, platform),
+    )
+    await conn.commit()
+    return cur.rowcount > 0
+
+
 async def get_contact_name(owner_id: int, chat_id: int, platform: str = TELEGRAM) -> str | None:
     """The name this owner uses for the given contact (may be renamed)."""
     async with _conn_or_error().execute(
@@ -305,6 +397,24 @@ async def get_owners_for_contact(contact_id: int, platform: str = TELEGRAM) -> l
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_owner(row) for row in rows]
+
+
+async def get_contacts_by_phone(phone: str) -> list[dict]:
+    """Contacts across all owners that carry this phone number (any platform).
+
+    Used to route a MAX reply back when the subscriber was reached by a
+    phone-linked contact (dual Telegram+MAX delivery) rather than a native
+    MAX contact. Returns rows with ``owner_id``, ``name``, ``platform``.
+    """
+    if not phone:
+        return []
+    async with _conn_or_error().execute(
+        "SELECT owner_id, name, platform, chat_id FROM contacts "
+        "WHERE phone = ? AND phone <> ''",
+        (phone,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +480,62 @@ async def get_last_sos_owner(contact_id: int, platform: str = TELEGRAM) -> int |
     ) as cur:
         row = await cur.fetchone()
     return row["owner_id"] if row else None
+
+
+async def set_max_peer(phone: str, chat_id: int | None = None, user_id: int | None = None) -> None:
+    """Cache the MAX dialog for a phone (learned when we resolve/receive)."""
+    conn = _conn_or_error()
+    await conn.execute(
+        "INSERT INTO max_peer(phone, chat_id, user_id) VALUES (?, ?, ?) "
+        "ON CONFLICT(phone) DO UPDATE SET "
+        "chat_id = COALESCE(excluded.chat_id, max_peer.chat_id), "
+        "user_id = COALESCE(excluded.user_id, max_peer.user_id)",
+        (phone, chat_id, user_id),
+    )
+    await conn.commit()
+
+
+async def clear_max_peers() -> int:
+    """Drop all cached MAX dialogs (e.g. after the service account changes —
+    dialog ids are computed from the account's own id and become invalid)."""
+    conn = _conn_or_error()
+    cur = await conn.execute("DELETE FROM max_peer")
+    await conn.commit()
+    return cur.rowcount
+
+
+async def get_meta(key: str) -> str | None:
+    async with _conn_or_error().execute(
+        "SELECT value FROM meta WHERE key = ?", (key,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row["value"] if row else None
+
+
+async def set_meta(key: str, value: str) -> None:
+    conn = _conn_or_error()
+    await conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    await conn.commit()
+
+
+async def get_max_chat_id(phone: str) -> int | None:
+    async with _conn_or_error().execute(
+        "SELECT chat_id FROM max_peer WHERE phone = ?", (phone,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row["chat_id"] if row and row["chat_id"] is not None else None
+
+
+async def get_max_phone_by_user(user_id: int) -> str | None:
+    async with _conn_or_error().execute(
+        "SELECT phone FROM max_peer WHERE user_id = ?", (user_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row["phone"] if row else None
 
 
 async def get_recent_sos_owners(contact_id: int, platform: str = TELEGRAM,
