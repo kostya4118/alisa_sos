@@ -1,5 +1,5 @@
+import secrets
 import time
-import uuid
 from dataclasses import dataclass, field
 
 import aiosqlite
@@ -210,7 +210,7 @@ async def get_all_owners() -> list[Owner]:
 
 async def create_owner(chat_id: int, name: str, status: str = "active",
                        platform: str = TELEGRAM) -> Owner:
-    token = str(uuid.uuid4())
+    token = secrets.token_urlsafe(32)  # 256-bit, cryptographically strong
     conn = _conn_or_error()
     await conn.execute(
         "INSERT INTO owners(chat_id, name, webhook_token, status, platform) "

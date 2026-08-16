@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 def create_app(telegram_bot: Bot, max_bot=None) -> FastAPI:
-    app = FastAPI(title="Alisa SOS", docs_url=None, redoc_url=None)
+    # docs/redoc/openapi all disabled: this API is a machine webhook, not a
+    # browsable API — no schema should leak the app version or endpoints.
+    app = FastAPI(title="Alisa SOS", docs_url=None, redoc_url=None, openapi_url=None)
     app.state.bot = telegram_bot
     app.state.max_bot = max_bot
     app.include_router(alice.router)
