@@ -54,12 +54,12 @@ async def _deliver_reply(tg_bot, owner: db.Owner, contact_chat_id: int,
 async def _subscribe_links_text(tg_bot, owner: db.Owner) -> str:
     """Subscribe links for every available platform."""
     bot_info = await tg_bot.get_me()
-    tg_link = f"https://t.me/{bot_info.username}?start=sub_{owner.webhook_token}"
+    tg_link = f"https://t.me/{bot_info.username}?start=sub_{owner.subscribe_code}"
     lines = [f"📱 Telegram:\n{tg_link}"]
     if messaging.max_enabled():
         try:
             import max_bot
-            max_link = await max_bot.build_subscribe_link(owner.webhook_token)
+            max_link = await max_bot.build_subscribe_link(owner.subscribe_code)
             if max_link:
                 lines.append(f"🅼 MAX:\n{max_link}")
         except Exception:
@@ -170,10 +170,10 @@ def _is_admin(chat_id: int) -> bool:
 async def cmd_start(message: Message) -> None:
     payload = message.text.split(maxsplit=1)[1] if len(message.text.split()) > 1 else ""
 
-    # Deep-link subscription: /start sub_<webhook_token>
+    # Deep-link subscription: /start sub_<subscribe_code>
     if payload.startswith("sub_"):
         token = payload[4:]
-        owner = await db.get_owner_by_token(token)
+        owner = await db.get_owner_by_subscribe_code(token)
         if owner is None:
             await message.answer("Ссылка недействительна. Попросите отправителя поделиться новой ссылкой.")
             return
@@ -474,6 +474,33 @@ async def callback_admin_delete_confirm(callback: CallbackQuery) -> None:
 async def callback_admin_cancel(callback: CallbackQuery) -> None:
     await callback.message.edit_text("Отменено.")
     await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Security: rotate the Alice webhook secret
+# ---------------------------------------------------------------------------
+
+@router.message(Command("rotate"))
+async def cmd_rotate(message: Message) -> None:
+    """Issue a fresh Alice webhook token (e.g. if the old one leaked). The
+    public invite links (subscribe_code) are NOT affected."""
+    owner = await _get_active_owner(message.from_user.id, message)
+    if not owner:
+        return
+    new_token = await db.rotate_webhook_token(owner.chat_id)
+    if not new_token:
+        await message.answer("Не удалось обновить токен, попробуйте позже.")
+        return
+    webhook_url = f"{settings.base_url}/alice/{new_token}"
+    await message.answer(
+        "🔑 Секретный webhook-токен Алисы обновлён.\n\n"
+        "⚠️ Старый URL больше НЕ работает. Вставьте новый URL в настройки "
+        "навыка в Яндекс Диалогах:\n"
+        f"<code>{webhook_url}</code>\n\n"
+        "Ссылки-приглашения для друзей при этом не меняются — их пересылать заново не нужно.",
+        parse_mode="HTML",
+    )
+    await message.answer(guide.alice_skill_setup(webhook_url))
 
 
 # ---------------------------------------------------------------------------

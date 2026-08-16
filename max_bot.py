@@ -233,7 +233,7 @@ async def _register(chat_id: int, name: str) -> None:
 
 
 async def _subscribe(chat_id: int, name: str, token: str) -> None:
-    owner = await db.get_owner_by_token(token)
+    owner = await db.get_owner_by_subscribe_code(token)
     if owner is None:
         await _send(chat_id, "Ссылка недействительна. Попросите новую ссылку.")
         return
@@ -312,7 +312,7 @@ async def _menu_action(chat_id: int, payload: str) -> None:
     if payload == "menu_contacts":
         contacts = await db.get_contacts(owner.chat_id)
         if not contacts:
-            link = await build_subscribe_link(owner.webhook_token)
+            link = await build_subscribe_link(owner.subscribe_code)
             await _send(chat_id, f"Список контактов пуст.\n\nСсылка для друзей:\n{link or '—'}")
             return
         lines = [f"👥 Подписчики ({len(contacts)}):\n"]
@@ -352,7 +352,7 @@ async def _menu_action(chat_id: int, payload: str) -> None:
         await db.mark_replies_read(owner.chat_id)
 
     elif payload == "menu_link":
-        link = await build_subscribe_link(owner.webhook_token)
+        link = await build_subscribe_link(owner.subscribe_code)
         await _send(chat_id,
                     f"Ссылка для подписки (MAX):\n\n{link or '—'}\n\n"
                     "Отправьте её друзьям в MAX.", _menu_kb())
@@ -360,7 +360,7 @@ async def _menu_action(chat_id: int, payload: str) -> None:
     elif payload == "menu_status":
         contacts = await db.get_contacts(owner.chat_id)
         webhook_url = f"{settings.base_url}/alice/{owner.webhook_token}"
-        link = await build_subscribe_link(owner.webhook_token)
+        link = await build_subscribe_link(owner.subscribe_code)
         await _send(
             chat_id,
             f"📊 Ваши настройки\n\n"

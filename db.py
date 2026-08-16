@@ -39,6 +39,7 @@ class Owner:
     platform: str = field(default=TELEGRAM)    # "telegram" | "max"
     sos_webhook_url: str = field(default="")   # optional outbound webhook on SOS
     sos_email: str = field(default="")         # optional e-mail bridge for "Телефон"
+    subscribe_code: str = field(default="")    # public invite code (NOT the Alice secret)
 
 
 @dataclass
@@ -66,7 +67,8 @@ async def init(path: str) -> None:
             webhook_token TEXT    NOT NULL UNIQUE,
             status        TEXT    NOT NULL DEFAULT 'active',
             platform      TEXT    NOT NULL DEFAULT 'telegram',
-            sos_webhook_url TEXT  NOT NULL DEFAULT ''
+            sos_webhook_url TEXT  NOT NULL DEFAULT '',
+            subscribe_code  TEXT  NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS contacts (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +126,7 @@ async def init(path: str) -> None:
         ("replies", "platform", "ALTER TABLE replies ADD COLUMN platform TEXT NOT NULL DEFAULT 'telegram'"),
         ("owners", "sos_webhook_url", "ALTER TABLE owners ADD COLUMN sos_webhook_url TEXT NOT NULL DEFAULT ''"),
         ("owners", "sos_email", "ALTER TABLE owners ADD COLUMN sos_email TEXT NOT NULL DEFAULT ''"),
+        ("owners", "subscribe_code", "ALTER TABLE owners ADD COLUMN subscribe_code TEXT NOT NULL DEFAULT ''"),
     ):
         try:
             await _conn.execute(ddl)
@@ -137,6 +140,20 @@ async def init(path: str) -> None:
         "CREATE INDEX IF NOT EXISTS idx_contacts_chat ON contacts(chat_id, platform)"
     )
     await _conn.commit()
+
+    # Backfill a public subscribe_code for owners created before this column
+    # existed (their invite links used to reuse the secret webhook_token).
+    async with _conn.execute(
+        "SELECT chat_id FROM owners WHERE subscribe_code = '' OR subscribe_code IS NULL"
+    ) as cur:
+        rows = await cur.fetchall()
+    for r in rows:
+        await _conn.execute(
+            "UPDATE owners SET subscribe_code = ? WHERE chat_id = ?",
+            (secrets.token_urlsafe(16), r["chat_id"]),
+        )
+    if rows:
+        await _conn.commit()
 
 
 async def close() -> None:
@@ -176,6 +193,7 @@ def _row_to_owner(row) -> Owner:
         platform=d.get("platform", TELEGRAM),
         sos_webhook_url=d.get("sos_webhook_url", "") or "",
         sos_email=d.get("sos_email", "") or "",
+        subscribe_code=d.get("subscribe_code", "") or "",
     )
 
 
@@ -210,17 +228,49 @@ async def get_all_owners() -> list[Owner]:
 
 async def create_owner(chat_id: int, name: str, status: str = "active",
                        platform: str = TELEGRAM) -> Owner:
-    token = secrets.token_urlsafe(32)  # 256-bit, cryptographically strong
+    token = secrets.token_urlsafe(32)  # 256-bit Alice webhook secret (never shared)
+    sub = secrets.token_urlsafe(16)    # public invite code (safe to share in links)
     conn = _conn_or_error()
     await conn.execute(
-        "INSERT INTO owners(chat_id, name, webhook_token, status, platform) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (chat_id, name, token, status, platform),
+        "INSERT INTO owners(chat_id, name, webhook_token, subscribe_code, status, platform) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, name, token, sub, status, platform),
     )
     await conn.commit()
     return Owner(chat_id=chat_id, name=name,
                  sos_message="🆘 ТРЕВОГА! Мне нужна помощь!",
-                 tz_offset=0, webhook_token=token, status=status, platform=platform)
+                 tz_offset=0, webhook_token=token, status=status, platform=platform,
+                 subscribe_code=sub)
+
+
+async def get_owner_by_subscribe_code(code: str) -> Owner | None:
+    """Resolve an invite deep-link code to its owner (public code, not the
+    Alice secret). Falls back to webhook_token so links shared before the
+    split still work."""
+    if not code:
+        return None
+    conn = _conn_or_error()
+    async with conn.execute(
+        "SELECT * FROM owners WHERE subscribe_code = ?", (code,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row:
+        return _row_to_owner(row)
+    # Backward-compat: old invite links carried the webhook_token itself.
+    return await get_owner_by_token(code)
+
+
+async def rotate_webhook_token(chat_id: int) -> str | None:
+    """Issue a fresh Alice webhook secret (invalidates the old URL and any
+    old invite link that leaked it). Returns the new token, or None if the
+    owner doesn't exist."""
+    conn = _conn_or_error()
+    token = secrets.token_urlsafe(32)
+    cur = await conn.execute(
+        "UPDATE owners SET webhook_token = ? WHERE chat_id = ?", (token, chat_id)
+    )
+    await conn.commit()
+    return token if cur.rowcount > 0 else None
 
 
 async def set_owner_status(chat_id: int, status: str) -> None:
