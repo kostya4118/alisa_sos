@@ -24,7 +24,6 @@ restart.
 import asyncio
 import logging
 import os
-import time
 
 import db
 from config import settings
@@ -40,10 +39,10 @@ _code_future: "asyncio.Future[str] | None" = None
 _code_phone: str = ""
 _password_future: "asyncio.Future[str] | None" = None
 
-# Admin gets an actionable login prompt (SMS code / 2FA / wrong number) at most
-# once per hour — background connection retries never message the admin at all.
-_PROMPT_THROTTLE_SEC = 3600
-_last_prompt_ts: float = 0.0
+# Digits of the wrong service number we already warned the admin about, so the
+# "logged in under the old number" warning fires once per number, not on every
+# reconnect. (SMS/2FA prompts are NOT throttled — they block, so they can't spam.)
+_warned_mismatch: str = ""
 
 
 def enabled() -> bool:
@@ -65,7 +64,7 @@ class _BotSmsCodeProvider:
         loop = asyncio.get_event_loop()
         _code_future = loop.create_future()
         logger.info("MAX userbot: SMS code requested for %s", phone)
-        await _notify_login_prompt(
+        await _notify_admin(
             f"🔐 MAX-аккаунт: на номер {phone} придёт SMS-код.\n"
             "Пришлите его командой:\n/maxcode 1234"
         )
@@ -96,7 +95,7 @@ class _BotPasswordProvider:
         _password_future = loop.create_future()
         logger.info("MAX userbot: 2FA password requested (hint=%r)", hint)
         h = f"\nПодсказка: {hint}" if hint else ""
-        await _notify_login_prompt(
+        await _notify_admin(
             "🔐 MAX-аккаунт требует пароль 2FA." + h + "\n"
             "Пришлите его командой:\n/maxpassword ВАШ_ПАРОЛЬ\n"
             "(после входа удалите сообщение с паролем)"
@@ -123,18 +122,6 @@ async def _notify_admin(text: str) -> None:
             await tg.send_message(settings.admin_chat_id, text)
     except Exception:
         logger.exception("failed to notify admin about MAX login")
-
-
-async def _notify_login_prompt(text: str) -> None:
-    """Send an actionable login prompt to the admin, throttled to at most once
-    per hour, so a stuck retry loop can't spam. Reset on a successful connect."""
-    global _last_prompt_ts
-    now = time.monotonic()
-    if _last_prompt_ts and (now - _last_prompt_ts) < _PROMPT_THROTTLE_SEC:
-        logger.info("MAX admin prompt suppressed (throttled): %s", text.split(chr(10))[0])
-        return
-    _last_prompt_ts = now
-    await _notify_admin(text)
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +185,8 @@ def _attach_handlers(client) -> None:
         _me_id = _extract_my_id(me)
         if _me_id is None:
             logger.error("MAX userbot: could not read own user id from profile %r", me)
-        global _last_prompt_ts
-        ok = await _on_account_check(me)
+        await _on_account_check(me)
         _ready.set()
-        if ok:
-            _last_prompt_ts = 0.0  # recovered — allow a fresh prompt on next problem
         # No "connected" ping to the admin — notify only when action is needed
         # (SMS code, 2FA password, wrong number). Success is silent.
         logger.info("MAX userbot ready (me_id=%s)", _me_id)
@@ -278,15 +262,19 @@ async def _on_account_check(me) -> bool:
         # Phone-mismatch → stale session for a different number.
         want = "".join(ch for ch in str(settings.max_userbot_phone or "") if ch.isdigit())
         got = _extract_my_phone(me)
+        global _warned_mismatch
         if want and got and want != got:
             logger.warning("MAX session is for +%s but MAX_USERBOT_PHONE=+%s — "
                            "delete data/max_session to switch numbers", got, want)
-            await _notify_login_prompt(
-                f"⚠️ MAX вошёл под старым номером +{got}, а в настройках +{want}.\n"
-                "Чтобы сменить сервисный номер: останови бот, удали папку "
-                "data/max_session и запусти снова — тогда попросит SMS на новый номер."
-            )
+            if got != _warned_mismatch:  # warn once per wrong number, not each reconnect
+                _warned_mismatch = got
+                await _notify_admin(
+                    f"⚠️ MAX вошёл под старым номером +{got}, а в настройках +{want}.\n"
+                    "Чтобы сменить сервисный номер: останови бот, удали папку "
+                    "data/max_session и запусти снова — тогда попросит SMS на новый номер."
+                )
             return False
+        _warned_mismatch = ""  # number matches — clear any prior warning latch
     except Exception:
         logger.exception("MAX account check failed")
     return True
