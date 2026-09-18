@@ -24,6 +24,7 @@ restart.
 import asyncio
 import logging
 import os
+import time
 
 import db
 from config import settings
@@ -38,9 +39,11 @@ _me_id: int | None = None
 _code_future: "asyncio.Future[str] | None" = None
 _code_phone: str = ""
 _password_future: "asyncio.Future[str] | None" = None
-# Last failure reason we alerted the admin about — so we notify once per new
-# problem instead of on every retry (was spamming every 10 min all night).
-_last_fail_notice: str | None = None
+
+# Admin gets an actionable login prompt (SMS code / 2FA / wrong number) at most
+# once per hour — background connection retries never message the admin at all.
+_PROMPT_THROTTLE_SEC = 3600
+_last_prompt_ts: float = 0.0
 
 
 def enabled() -> bool:
@@ -62,7 +65,7 @@ class _BotSmsCodeProvider:
         loop = asyncio.get_event_loop()
         _code_future = loop.create_future()
         logger.info("MAX userbot: SMS code requested for %s", phone)
-        await _notify_admin(
+        await _notify_login_prompt(
             f"🔐 MAX-аккаунт: на номер {phone} придёт SMS-код.\n"
             "Пришлите его командой:\n/maxcode 1234"
         )
@@ -93,7 +96,7 @@ class _BotPasswordProvider:
         _password_future = loop.create_future()
         logger.info("MAX userbot: 2FA password requested (hint=%r)", hint)
         h = f"\nПодсказка: {hint}" if hint else ""
-        await _notify_admin(
+        await _notify_login_prompt(
             "🔐 MAX-аккаунт требует пароль 2FA." + h + "\n"
             "Пришлите его командой:\n/maxpassword ВАШ_ПАРОЛЬ\n"
             "(после входа удалите сообщение с паролем)"
@@ -120,6 +123,18 @@ async def _notify_admin(text: str) -> None:
             await tg.send_message(settings.admin_chat_id, text)
     except Exception:
         logger.exception("failed to notify admin about MAX login")
+
+
+async def _notify_login_prompt(text: str) -> None:
+    """Send an actionable login prompt to the admin, throttled to at most once
+    per hour, so a stuck retry loop can't spam. Reset on a successful connect."""
+    global _last_prompt_ts
+    now = time.monotonic()
+    if _last_prompt_ts and (now - _last_prompt_ts) < _PROMPT_THROTTLE_SEC:
+        logger.info("MAX admin prompt suppressed (throttled): %s", text.split(chr(10))[0])
+        return
+    _last_prompt_ts = now
+    await _notify_admin(text)
 
 
 # ---------------------------------------------------------------------------
@@ -183,12 +198,13 @@ def _attach_handlers(client) -> None:
         _me_id = _extract_my_id(me)
         if _me_id is None:
             logger.error("MAX userbot: could not read own user id from profile %r", me)
-        global _last_fail_notice
-        await _on_account_check(me)
+        global _last_prompt_ts
+        ok = await _on_account_check(me)
         _ready.set()
-        _last_fail_notice = None  # recovered — allow a fresh alert on next failure
+        if ok:
+            _last_prompt_ts = 0.0  # recovered — allow a fresh prompt on next problem
         # No "connected" ping to the admin — notify only when action is needed
-        # (SMS code, 2FA password, wrong number, errors). Success is silent.
+        # (SMS code, 2FA password, wrong number). Success is silent.
         logger.info("MAX userbot ready (me_id=%s)", _me_id)
 
     # Inbound: a MAX user wrote to our service account → treat as a subscriber
@@ -236,8 +252,10 @@ def _extract_my_phone(me) -> str:
     return "".join(ch for ch in str(raw or "") if ch.isdigit())
 
 
-async def _on_account_check(me) -> None:
+async def _on_account_check(me) -> bool:
     """Guard against a leftover session from a previous service number.
+    Returns True if the logged-in number matches config (or no check possible),
+    False on a number mismatch (so the caller keeps the prompt throttled).
 
     - If the logged-in account changed, drop cached MAX dialogs (their ids are
       derived from the account's own id and would be wrong for the new one).
@@ -263,13 +281,15 @@ async def _on_account_check(me) -> None:
         if want and got and want != got:
             logger.warning("MAX session is for +%s but MAX_USERBOT_PHONE=+%s — "
                            "delete data/max_session to switch numbers", got, want)
-            await _notify_admin(
+            await _notify_login_prompt(
                 f"⚠️ MAX вошёл под старым номером +{got}, а в настройках +{want}.\n"
                 "Чтобы сменить сервисный номер: останови бот, удали папку "
                 "data/max_session и запусти снова — тогда попросит SMS на новый номер."
             )
+            return False
     except Exception:
         logger.exception("MAX account check failed")
+    return True
 
 
 async def run() -> None:
@@ -297,7 +317,6 @@ async def run() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as err:
-            global _last_fail_notice
             _ready.clear()
             logger.exception("MAX userbot login/run failed")
 
@@ -306,33 +325,16 @@ async def run() -> None:
             if _is_stale_session_error(err) and _clear_session():
                 logger.warning("MAX session token rejected — cleared session, "
                                "will re-login via SMS")
-                if _last_fail_notice != "stale":
-                    _last_fail_notice = "stale"
-                    await _notify_admin(
-                        "⚠️ MAX-аккаунт разлогинен (сессия устарела). "
-                        "Вхожу заново — как придёт SMS, пришлите /maxcode 1234."
-                    )
                 await asyncio.sleep(5)
                 backoff = 60
                 continue
 
-            if _is_transient_auth_error(err):
-                wait = max(backoff, 90)
-                kind = "auth"
-                msg = ("⚠️ MAX-аккаунт: код устарел или превышен лимит. "
-                       "Как придёт SMS — пришлите /maxcode 1234.")
-            else:
-                wait = backoff
-                kind = "conn"
-                msg = ("⚠️ MAX-аккаунт: проблема с подключением, переподключаюсь "
-                       "в фоне. Действий не требуется — сообщу, только если "
-                       "понадобится SMS-код.")
-            # Notify once per new problem, not on every retry (anti-spam).
-            if kind != _last_fail_notice:
-                _last_fail_notice = kind
-                await _notify_admin(msg)
+            # Background retries are SILENT: they self-heal and the admin can't
+            # act on them. The only admin messages are from get_code /
+            # get_password, sent when a code/password is actually being awaited.
+            wait = max(backoff, 90) if _is_transient_auth_error(err) else backoff
             await asyncio.sleep(wait)
-            backoff = min(backoff * 2, 600)
+            backoff = min(backoff * 2, 1800)  # cap ~30 min — don't hammer MAX
             continue
 
         # start() returned cleanly = the connection dropped; reconnect (the
