@@ -145,6 +145,28 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ---
 
+## Если сборка падает с `compose build requires buildx 0.17.0 or later`
+
+На серверах со старым Docker плагин buildx может быть слишком старым, и
+`docker compose up -d --build` откажется собирать образ. Обходной путь —
+собрать классическим билдером и поднять **без** `--build`:
+
+```bash
+cd ~/alisa_sos
+DOCKER_BUILDKIT=0 docker build -t alisa_sos-bot .
+docker compose up -d
+```
+
+Тег `alisa_sos-bot` — это имя образа, которое compose ожидает для сервиса
+`bot` в проекте `alisa_sos`, поэтому `docker compose up -d` подхватит готовый
+образ и просто запустит контейнер со всеми настройками из
+`docker-compose.yml`. **Эту же пару команд используйте при каждом обновлении
+на таком сервере** (вместо `docker compose up -d --build`).
+
+Альтернатива — обновить плагин: `sudo apt-get install -y docker-buildx-plugin`.
+
+---
+
 ## Важные нюансы
 
 - **Домен тот же** → `BASE_URL` в `.env` не меняется, URL Алисы и ссылки-
